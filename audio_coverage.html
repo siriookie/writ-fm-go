@@ -1,0 +1,246 @@
+
+<!DOCTYPE html>
+<html>
+	<head>
+		<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+		<title>audio: Go Coverage Report</title>
+		<style>
+			body {
+				background: black;
+				color: rgb(80, 80, 80);
+			}
+			body, pre, #legend span {
+				font-family: Menlo, monospace;
+				font-weight: bold;
+			}
+			#topbar {
+				background: black;
+				position: fixed;
+				top: 0; left: 0; right: 0;
+				height: 42px;
+				border-bottom: 1px solid rgb(80, 80, 80);
+			}
+			#content {
+				margin-top: 50px;
+			}
+			#nav, #legend {
+				float: left;
+				margin-left: 10px;
+			}
+			#legend {
+				margin-top: 12px;
+			}
+			#nav {
+				margin-top: 10px;
+			}
+			#legend span {
+				margin: 0 5px;
+			}
+			.cov0 { color: rgb(192, 0, 0) }
+.cov1 { color: rgb(128, 128, 128) }
+.cov2 { color: rgb(116, 140, 131) }
+.cov3 { color: rgb(104, 152, 134) }
+.cov4 { color: rgb(92, 164, 137) }
+.cov5 { color: rgb(80, 176, 140) }
+.cov6 { color: rgb(68, 188, 143) }
+.cov7 { color: rgb(56, 200, 146) }
+.cov8 { color: rgb(44, 212, 149) }
+.cov9 { color: rgb(32, 224, 152) }
+.cov10 { color: rgb(20, 236, 155) }
+
+		</style>
+	</head>
+	<body>
+		<div id="topbar">
+			<div id="nav">
+				<select id="files">
+				
+				<option value="file0">github.com/writ-fm/go/internal/audio/decoder.go (55.9%)</option>
+				
+				</select>
+			</div>
+			<div id="legend">
+				<span>not tracked</span>
+			
+				<span class="cov0">not covered</span>
+				<span class="cov8">covered</span>
+			
+			</div>
+		</div>
+		<div id="content">
+		
+		<pre class="file" id="file0" style="display: none">// Package audio manages ffmpeg subprocesses for decoding and encoding audio.
+package audio
+
+import (
+        "fmt"
+        "io"
+        "os/exec"
+        "strconv"
+        "strings"
+)
+
+// DecodeOptions configures how an audio file is decoded to raw PCM.
+type DecodeOptions struct {
+        // IsSpeech selects -14 LUFS loudnorm (speech clarity) and disables
+        // fade effects. False (music/bumper) uses -16 LUFS with 8s fade in/out.
+        IsSpeech bool
+
+        // StartTime offsets playback into the file, in seconds.
+        // Zero means start from the beginning (no -ss flag emitted).
+        StartTime float64
+
+        // Duration limits how much of the file is decoded, in seconds.
+        // Nil means decode to end of file (no -t flag emitted).
+        Duration *float64
+}
+
+// Decoder wraps an ffmpeg subprocess that emits raw PCM on its stdout pipe.
+//
+// Output format is always: signed 16-bit little-endian (s16le), 44100 Hz,
+// stereo (2 channels). This fixed format lets multiple sources be appended
+// to the same encoder stdin without gaps or audio glitches.
+//
+// Decoder implements io.ReadCloser:
+//   - Read returns PCM bytes; io.EOF signals the audio is finished.
+//   - Close kills the ffmpeg process and releases all resources.
+type Decoder struct {
+        cmd    *exec.Cmd
+        stdout io.ReadCloser
+}
+
+// Read returns raw PCM bytes from the decoder. Satisfies io.Reader.
+func (d *Decoder) Read(p []byte) (int, error) <span class="cov0" title="0">{
+        return d.stdout.Read(p)
+}</span>
+
+// Close stops the ffmpeg process and releases the stdout pipe.
+// Safe to call after Read returns io.EOF, and safe to call without reading.
+func (d *Decoder) Close() error <span class="cov0" title="0">{
+        // Kill first — if the process already exited, Kill is a no-op on the OS
+        // level (error is harmless). We must call Wait to reap the zombie.
+        _ = d.cmd.Process.Kill()
+        // Close the pipe so any blocked Read in another goroutine unblocks.
+        _ = d.stdout.Close()
+        // Reap the process; ignore the error (always non-nil after Kill).
+        _ = d.cmd.Wait()
+        return nil
+}</span>
+
+// NewDecoder starts an ffmpeg decoder for the given audio file path.
+// The caller must call Close() when done, regardless of whether Read
+// reaches io.EOF.
+func NewDecoder(path string, opts DecodeOptions) (*Decoder, error) <span class="cov0" title="0">{
+        args := buildArgs(path, opts)
+        cmd := exec.Command(args[0], args[1:]...)
+
+        stdout, err := cmd.StdoutPipe()
+        if err != nil </span><span class="cov0" title="0">{
+                return nil, fmt.Errorf("audio: stdout pipe: %w", err)
+        }</span>
+        <span class="cov0" title="0">cmd.Stderr = io.Discard // suppress ffmpeg progress/warning output
+
+        if err := cmd.Start(); err != nil </span><span class="cov0" title="0">{
+                return nil, fmt.Errorf("audio: start decoder: %w", err)
+        }</span>
+
+        <span class="cov0" title="0">return &amp;Decoder{cmd: cmd, stdout: stdout}, nil</span>
+}
+
+// buildArgs constructs the ffmpeg argument slice for decoding path to PCM.
+//
+// Filter chain (in order):
+//  1. loudnorm  — normalise loudness (-14 LUFS speech / -16 LUFS music)
+//  2. afade in  — 8-second fade-in for music bumpers only
+//  3. afade out — 8-second fade-out for music bumpers longer than 16 seconds
+//  4. aresample — force output to 44100 Hz
+func buildArgs(path string, opts DecodeOptions) []string <span class="cov8" title="1">{
+        args := []string{"ffmpeg", "-v", "warning"}
+
+        // -ss before -i = container-level (fast) seek; after -i = slow decode seek.
+        if opts.StartTime &gt; 0 </span><span class="cov8" title="1">{
+                args = append(args, "-ss", formatSecs(opts.StartTime))
+        }</span>
+
+        <span class="cov8" title="1">args = append(args, "-i", path)
+
+        if opts.Duration != nil </span><span class="cov8" title="1">{
+                args = append(args, "-t", formatSecs(*opts.Duration))
+        }</span>
+
+        <span class="cov8" title="1">filters := make([]string, 0, 4)
+
+        if opts.IsSpeech </span><span class="cov8" title="1">{
+                // Speech: louder target (-14 LUFS), tight range (LRA=7) for clarity.
+                filters = append(filters, "loudnorm=I=-14:TP=-1.5:LRA=7")
+        }</span> else<span class="cov8" title="1"> {
+                // Music: slightly quieter (-16 LUFS), wider range (LRA=11) for dynamics.
+                filters = append(filters, "loudnorm=I=-16:TP=-1.5:LRA=11")
+                // 8-second fade-in prevents a jarring cut-in at full volume.
+                filters = append(filters, "afade=t=in:st=0:d=8")
+                // Fade-out only when we know the duration and the track is long enough
+                // that the fade doesn't eat into the audible content.
+                if opts.Duration != nil &amp;&amp; *opts.Duration &gt; 16 </span><span class="cov8" title="1">{
+                        fadeStart := *opts.Duration - 8
+                        if fadeStart &lt; 0 </span><span class="cov0" title="0">{
+                                fadeStart = 0
+                        }</span>
+                        <span class="cov8" title="1">filters = append(filters, fmt.Sprintf("afade=t=out:st=%.3f:d=8", fadeStart))</span>
+                }
+        }
+
+        // aresample last: ensures every source lands at 44100 Hz regardless of
+        // its original sample rate, so PCM chunks from different files are byte-
+        // compatible when written to the same encoder stdin.
+        <span class="cov8" title="1">filters = append(filters, "aresample=44100")
+
+        args = append(args,
+                "-vn",                            // discard video (some WAVs embed album art)
+                "-af", strings.Join(filters, ","),
+                "-f", "s16le",                    // raw PCM, signed 16-bit little-endian
+                "-acodec", "pcm_s16le",
+                "-ar", "44100",
+                "-ac", "2",                       // stereo
+                "-",                              // write to stdout
+        )
+
+        return args</span>
+}
+
+// formatSecs formats a float64 number of seconds into the shortest decimal
+// string accepted by ffmpeg (e.g. 10.5 → "10.5", 30.0 → "30").
+func formatSecs(s float64) string <span class="cov8" title="1">{
+        return strconv.FormatFloat(s, 'f', -1, 64)
+}</span>
+</pre>
+		
+		</div>
+	</body>
+	<script>
+	(function() {
+		var files = document.getElementById('files');
+		var visible;
+		files.addEventListener('change', onChange, false);
+		function select(part) {
+			if (visible)
+				visible.style.display = 'none';
+			visible = document.getElementById(part);
+			if (!visible)
+				return;
+			files.value = part;
+			visible.style.display = 'block';
+			location.hash = part;
+		}
+		function onChange() {
+			select(files.value);
+			window.scrollTo(0, 0);
+		}
+		if (location.hash != "") {
+			select(location.hash.substr(1));
+		}
+		if (!visible) {
+			select("file0");
+		}
+	})();
+	</script>
+</html>

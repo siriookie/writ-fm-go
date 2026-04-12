@@ -1,0 +1,22 @@
+timezone: local
+
+shows:
+  test_show:
+    name: "Test Show"
+    description: "A minimal show used by streamer unit tests."
+    host: "tester"
+    topic_focus: "testing"
+    segment_types: ["deep_dive"]
+    bumper_style: "ambient"
+    voices:
+      host: "test_voice"
+
+schedule:
+  base:
+    # Two blocks that together cover all 1440 minutes of the day.
+    - show: test_show
+      start: "00:00"
+      end: "23:00"
+    - show: test_show
+      start: "23:00"
+      end: "00:00"
