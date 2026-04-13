@@ -1,0 +1,8 @@
+services:
+  icecast:
+    image: docker.1ms.run/libretime/icecast:2.4.4
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./icecast.xml:/etc/icecast2/icecast.xml:ro
+    restart: unless-stopped
