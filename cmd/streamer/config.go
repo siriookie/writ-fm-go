@@ -11,6 +11,9 @@ type Config struct {
 	SchedulePath    string // path to schedule YAML, e.g. config/schedule.yaml
 	TalkSegmentsDir string // path to output/talk_segments
 	BumperDir       string // path to output/music_bumpers
+	ControlAddr     string // TCP address for the HTTP control server, e.g. 127.0.0.1:6600; empty = disabled
+	NowPlayingPath  string // path to write now-playing.json; empty = disabled
+	IcecastBaseURL  string // e.g. http://localhost:8000 for listener polling; empty = disabled
 }
 
 // configFromEnv reads configuration from environment variables.
@@ -41,5 +44,8 @@ func configFromEnv() (Config, error) {
 		SchedulePath:    schedulePath,
 		TalkSegmentsDir: talkDir,
 		BumperDir:       bumperDir,
+		ControlAddr:     os.Getenv("CONTROL_ADDR"),
+		NowPlayingPath:  os.Getenv("NOW_PLAYING_PATH"),
+		IcecastBaseURL:  os.Getenv("ICECAST_BASE_URL"),
 	}, nil
 }

@@ -5,10 +5,16 @@ import (
 	"io"
 	"log"
 	"math/rand"
+	"net/http"
+	"net/url"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/writ-fm/go/internal/audio"
+	"github.com/writ-fm/go/internal/control"
+	"github.com/writ-fm/go/internal/icecast"
+	"github.com/writ-fm/go/internal/nowplaying"
 	"github.com/writ-fm/go/internal/scheduler"
 	"github.com/writ-fm/go/internal/store"
 )
@@ -68,6 +74,28 @@ func run(ctx context.Context, cfg Config) {
 	talks := store.NewTalkStore(cfg.TalkSegmentsDir)
 	bumpers := store.NewBumperStore(cfg.BumperDir)
 
+	ctrl := control.NewController()
+	if cfg.ControlAddr != "" {
+		srv := &http.Server{Addr: cfg.ControlAddr, Handler: ctrl}
+		go func() {
+			if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				log.Printf("streamer: control server: %v", err)
+			}
+		}()
+		defer func() {
+			shutCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			_ = srv.Shutdown(shutCtx)
+		}()
+		log.Printf("streamer: control server listening on %s", cfg.ControlAddr)
+	}
+
+	if cfg.IcecastBaseURL != "" {
+		ic := icecast.NewClient(cfg.IcecastBaseURL)
+		mount := icecastMount(cfg.IcecastURL)
+		go pollListeners(ctx, ic, mount)
+	}
+
 	for {
 		if ctx.Err() != nil {
 			return
@@ -88,7 +116,7 @@ func run(ctx context.Context, cfg Config) {
 		}
 
 		log.Printf("streamer: encoder connected to %s", cfg.IcecastURL)
-		runInner(ctx, enc, sched, talks, bumpers)
+		runInner(ctx, enc, sched, talks, bumpers, ctrl, cfg.NowPlayingPath)
 		_ = enc.Close()
 
 		if ctx.Err() != nil {
@@ -96,6 +124,35 @@ func run(ctx context.Context, cfg Config) {
 		}
 		log.Printf("streamer: encoder exited unexpectedly, restarting in %v", encoderRestartDelay)
 		contextSleep(ctx, encoderRestartDelay)
+	}
+}
+
+// icecastMount extracts the mountpoint path from an Icecast source URL.
+// E.g. "icecast://source:pass@localhost:8000/stream" → "/stream".
+func icecastMount(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Path == "" {
+		return "/stream"
+	}
+	return u.Path
+}
+
+// pollListeners periodically fetches the listener count from Icecast and logs it.
+func pollListeners(ctx context.Context, ic *icecast.Client, mount string) {
+	ticker := time.NewTicker(60 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			n, err := ic.Listeners(mount)
+			if err != nil {
+				log.Printf("streamer: listeners: %v", err)
+			} else {
+				log.Printf("streamer: listeners: %d", n)
+			}
+		case <-ctx.Done():
+			return
+		}
 	}
 }
 
@@ -108,6 +165,8 @@ func runInner(
 	sched *scheduler.StationSchedule,
 	talks *store.TalkStore,
 	bumpers *store.BumperStore,
+	ctrl *control.Controller,
+	nowPlayingPath string,
 ) {
 	var lastBumperPath string
 
@@ -142,8 +201,21 @@ func runInner(
 		// talk segment, rather than after the entire batch is drained.
 		seg := segs[0]
 
+		if nowPlayingPath != "" {
+			if err := nowplaying.Write(nowPlayingPath, nowplaying.Track{
+				ShowID:    show.ShowID,
+				ShowName:  show.Name,
+				Type:      "talk",
+				File:      filepath.Base(seg.Path),
+				UpdatedAt: time.Now(),
+			}); err != nil {
+				log.Printf("streamer: write now-playing: %v", err)
+			}
+		}
+
 		log.Printf("streamer: playing talk %s", seg.Path)
-		if err := pipeDecode(seg.Path, audio.DecodeOptions{IsSpeech: true}, enc, nil); err != nil {
+		skipCh := ctrl.NextSegment()
+		if err := pipeDecode(seg.Path, audio.DecodeOptions{IsSpeech: true}, enc, skipCh); err != nil {
 			log.Printf("streamer: pipe talk %s: %v", seg.Path, err)
 		}
 		if err := os.Remove(seg.Path); err != nil && !os.IsNotExist(err) {
@@ -167,6 +239,18 @@ func runInner(
 			}
 			if bumper == nil {
 				break // pool empty for this show
+			}
+
+			if nowPlayingPath != "" {
+				if err := nowplaying.Write(nowPlayingPath, nowplaying.Track{
+					ShowID:    show.ShowID,
+					ShowName:  show.Name,
+					Type:      "bumper",
+					File:      filepath.Base(bumper.Path),
+					UpdatedAt: time.Now(),
+				}); err != nil {
+					log.Printf("streamer: write now-playing: %v", err)
+				}
 			}
 
 			log.Printf("streamer: playing bumper %s (%.0fs)", bumper.Path, bumper.Duration)

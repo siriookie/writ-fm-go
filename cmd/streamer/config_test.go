@@ -17,6 +17,9 @@ func TestConfigFromEnv_Defaults(t *testing.T) {
 	t.Setenv("SCHEDULE_PATH", "")
 	t.Setenv("TALK_SEGMENTS_DIR", "")
 	t.Setenv("BUMPER_DIR", "")
+	t.Setenv("CONTROL_ADDR", "")
+	t.Setenv("NOW_PLAYING_PATH", "")
+	t.Setenv("ICECAST_BASE_URL", "")
 
 	cfg, err := configFromEnv()
 	if err != nil {
@@ -34,6 +37,15 @@ func TestConfigFromEnv_Defaults(t *testing.T) {
 	if cfg.BumperDir != "output/music_bumpers" {
 		t.Errorf("BumperDir = %q, want output/music_bumpers", cfg.BumperDir)
 	}
+	if cfg.ControlAddr != "" {
+		t.Errorf("ControlAddr = %q, want empty (disabled)", cfg.ControlAddr)
+	}
+	if cfg.NowPlayingPath != "" {
+		t.Errorf("NowPlayingPath = %q, want empty (disabled)", cfg.NowPlayingPath)
+	}
+	if cfg.IcecastBaseURL != "" {
+		t.Errorf("IcecastBaseURL = %q, want empty (disabled)", cfg.IcecastBaseURL)
+	}
 }
 
 func TestConfigFromEnv_AllEnvVars(t *testing.T) {
@@ -41,6 +53,9 @@ func TestConfigFromEnv_AllEnvVars(t *testing.T) {
 	t.Setenv("SCHEDULE_PATH", "/etc/writ-fm/schedule.yaml")
 	t.Setenv("TALK_SEGMENTS_DIR", "/var/writ-fm/talk")
 	t.Setenv("BUMPER_DIR", "/var/writ-fm/bumpers")
+	t.Setenv("CONTROL_ADDR", "127.0.0.1:6600")
+	t.Setenv("NOW_PLAYING_PATH", "/var/writ-fm/now-playing.json")
+	t.Setenv("ICECAST_BASE_URL", "http://radio.example.com:8000")
 
 	cfg, err := configFromEnv()
 	if err != nil {
@@ -57,5 +72,14 @@ func TestConfigFromEnv_AllEnvVars(t *testing.T) {
 	}
 	if cfg.BumperDir != "/var/writ-fm/bumpers" {
 		t.Errorf("BumperDir = %q", cfg.BumperDir)
+	}
+	if cfg.ControlAddr != "127.0.0.1:6600" {
+		t.Errorf("ControlAddr = %q, want 127.0.0.1:6600", cfg.ControlAddr)
+	}
+	if cfg.NowPlayingPath != "/var/writ-fm/now-playing.json" {
+		t.Errorf("NowPlayingPath = %q", cfg.NowPlayingPath)
+	}
+	if cfg.IcecastBaseURL != "http://radio.example.com:8000" {
+		t.Errorf("IcecastBaseURL = %q", cfg.IcecastBaseURL)
 	}
 }
