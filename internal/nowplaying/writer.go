@@ -9,12 +9,32 @@ import (
 )
 
 // Track is the now-playing state written to disk as JSON.
+//
+// JSON field names match the Python api_server.py / stream_gapless.py schema so
+// that the same now-playing.json can be consumed by the web frontend, OBS browser
+// sources, and any tooling already written against the Python version.
 type Track struct {
-	ShowID    string    `json:"show_id"`
-	ShowName  string    `json:"show_name"`
-	Type      string    `json:"type"` // "talk" or "bumper"
-	File      string    `json:"file"` // basename of the audio file
-	UpdatedAt time.Time `json:"updated_at"`
+	// Core identification — present for every track.
+	ShowID   string `json:"show_id"`
+	ShowName string `json:"show"`
+	Type     string `json:"type"` // "talk" | "bumper"
+
+	// Display name shown to listeners.
+	// For talk: output of CleanName (friendly segment label).
+	// For bumpers: BumperTrack.DisplayName, or "AI Music" as fallback.
+	Name string `json:"track"`
+
+	// Talk-only fields; omitted from JSON when empty.
+	Host        string `json:"host,omitempty"`         // persona / host id
+	SegmentType string `json:"segment_type,omitempty"` // e.g. "deep_dive"
+
+	// Bumper-only fields; omitted from JSON when zero/false.
+	AIGenerated bool   `json:"ai_generated,omitempty"`
+	Caption     string `json:"caption,omitempty"` // AI generation prompt excerpt
+
+	// Runtime state.
+	Listeners int       `json:"listeners"`
+	UpdatedAt time.Time `json:"timestamp"`
 }
 
 // Write atomically writes t as JSON to path.

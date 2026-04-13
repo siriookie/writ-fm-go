@@ -4,6 +4,8 @@ package control
 import (
 	"net/http"
 	"sync"
+
+	"github.com/go-chi/chi/v5"
 )
 
 // Controller manages a per-segment skip signal and acts as an HTTP handler.
@@ -19,11 +21,14 @@ import (
 type Controller struct {
 	mu      sync.Mutex
 	current chan struct{} // closed when Skip is called; nil between segments
+	router  http.Handler
 }
 
 // NewController returns an idle Controller with no active segment.
 func NewController() *Controller {
-	return &Controller{}
+	c := &Controller{}
+	c.router = c.newRouter()
+	return c
 }
 
 // NextSegment returns a fresh skip channel for the upcoming audio segment.
@@ -54,14 +59,15 @@ func (c *Controller) Skip() {
 //
 // All other paths respond 404; non-POST methods on /skip respond 405.
 func (c *Controller) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != "/skip" {
-		http.NotFound(w, r)
-		return
-	}
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	c.Skip()
-	w.WriteHeader(http.StatusNoContent)
+	c.router.ServeHTTP(w, r)
+}
+
+func (c *Controller) newRouter() http.Handler {
+	r := chi.NewRouter()
+	r.Post(
+		"/skip", func(w http.ResponseWriter, r *http.Request) {
+			c.Skip()
+			w.WriteHeader(http.StatusNoContent)
+		})
+	return r
 }

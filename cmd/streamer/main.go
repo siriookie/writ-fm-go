@@ -5,6 +5,8 @@ import (
 	"log"
 	"os/signal"
 	"syscall"
+
+	streamerapp "github.com/writ-fm/go/internal/streamer"
 )
 
 func main() {
@@ -19,6 +21,6 @@ func main() {
 	defer stop()
 
 	log.Printf("streamer: starting (Icecast=%s, schedule=%s)", cfg.IcecastURL, cfg.SchedulePath)
-	run(ctx, cfg)
+	streamerapp.Run(ctx, cfg)
 	log.Printf("streamer: shutdown complete")
 }

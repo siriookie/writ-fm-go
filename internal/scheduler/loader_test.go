@@ -15,9 +15,9 @@ func projectRoot(t *testing.T) string {
 	if !ok {
 		t.Fatal("runtime.Caller failed")
 	}
-	// thisFile = …/go/internal/scheduler/loader_test.go
-	// root      = …/  (three levels up)
-	root := filepath.Join(filepath.Dir(thisFile), "..", "..", "..")
+	// thisFile = …/go/writ-fm-go/internal/scheduler/loader_test.go
+	// root      = …/go/writ-fm-go/  (two levels up)
+	root := filepath.Join(filepath.Dir(thisFile), "..", "..")
 	return filepath.Clean(root)
 }
 

@@ -13,11 +13,14 @@ func TestWrite_CreatesFileWithCorrectContent(t *testing.T) {
 	path := filepath.Join(dir, "now-playing.json")
 
 	track := Track{
-		ShowID:    "midnight_signal",
-		ShowName:  "Midnight Signal",
-		Type:      "talk",
-		File:      "deep_dive_philosophy_20260413.wav",
-		UpdatedAt: time.Date(2026, 4, 13, 0, 0, 0, 0, time.UTC),
+		ShowID:      "midnight_signal",
+		ShowName:    "Midnight Signal",
+		Type:        "talk",
+		Name:        "Deep Dive",
+		Host:        "signal_host",
+		SegmentType: "deep_dive",
+		Listeners:   3,
+		UpdatedAt:   time.Date(2026, 4, 13, 0, 0, 0, 0, time.UTC),
 	}
 	if err := Write(path, track); err != nil {
 		t.Fatalf("Write: %v", err)
@@ -40,8 +43,67 @@ func TestWrite_CreatesFileWithCorrectContent(t *testing.T) {
 	if got.Type != track.Type {
 		t.Errorf("Type = %q, want %q", got.Type, track.Type)
 	}
-	if got.File != track.File {
-		t.Errorf("File = %q, want %q", got.File, track.File)
+	if got.Name != track.Name {
+		t.Errorf("Name = %q, want %q", got.Name, track.Name)
+	}
+	if got.Host != track.Host {
+		t.Errorf("Host = %q, want %q", got.Host, track.Host)
+	}
+	if got.SegmentType != track.SegmentType {
+		t.Errorf("SegmentType = %q, want %q", got.SegmentType, track.SegmentType)
+	}
+	if got.Listeners != track.Listeners {
+		t.Errorf("Listeners = %d, want %d", got.Listeners, track.Listeners)
+	}
+}
+
+func TestWrite_JSONTagsMatchPythonSchema(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "now-playing.json")
+
+	track := Track{
+		ShowID:      "the_loop",
+		ShowName:    "The Loop",
+		Type:        "bumper",
+		Name:        "Night Drift",
+		AIGenerated: true,
+		Caption:     "dreamy ambient textures",
+		Listeners:   7,
+		UpdatedAt:   time.Now(),
+	}
+	if err := Write(path, track); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	data, _ := os.ReadFile(path)
+	var raw map[string]any
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatalf("Unmarshal raw: %v", err)
+	}
+
+	for _, key := range []string{"show_id", "show", "type", "track", "listeners", "timestamp"} {
+		if _, ok := raw[key]; !ok {
+			t.Errorf("JSON key %q missing in output", key)
+		}
+	}
+	if raw["show_id"] != "the_loop" {
+		t.Errorf("show_id = %v, want the_loop", raw["show_id"])
+	}
+	if raw["show"] != "The Loop" {
+		t.Errorf("show = %v, want The Loop", raw["show"])
+	}
+	if raw["track"] != "Night Drift" {
+		t.Errorf("track = %v, want Night Drift", raw["track"])
+	}
+	if raw["ai_generated"] != true {
+		t.Errorf("ai_generated = %v, want true", raw["ai_generated"])
+	}
+	// omitempty fields absent when zero
+	if _, ok := raw["host"]; ok {
+		t.Errorf("host key should be omitted when empty")
+	}
+	if _, ok := raw["segment_type"]; ok {
+		t.Errorf("segment_type key should be omitted when empty")
 	}
 }
 

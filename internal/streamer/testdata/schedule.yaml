@@ -1,0 +1,21 @@
+timezone: local
+
+shows:
+  midnight_signal:
+    name: "Midnight Signal"
+    description: "Philosophy, memory, and the transmissions that only come through after midnight."
+    host: "liminal_operator"
+    topic_focus: "philosophy"
+    segment_types: ["deep_dive", "story", "interview", "listener_mailbag"]
+    bumper_style: "ambient"
+    voices:
+      host: "am_michael"
+
+schedule:
+  base:
+    - start: "00:00"
+      end: "12:00"
+      show: "midnight_signal"
+    - start: "12:00"
+      end: "00:00"
+      show: "midnight_signal"
