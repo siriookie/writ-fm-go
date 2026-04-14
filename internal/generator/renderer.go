@@ -22,8 +22,9 @@ const (
 
 var (
 	sentenceExtractRE = regexp.MustCompile(`[^.!?]+[.!?]?`)
-	speakerSplitRE    = regexp.MustCompile(`((?:HOST_A|HOST_B|GUEST|HOST|[A-Z][A-Z\s.]+):)`)
-	speakerTagRE      = regexp.MustCompile(`^(?:HOST_A|HOST_B|GUEST|HOST|[A-Z][A-Z\s.]+):$`)
+	speakerSplitRE    = regexp.MustCompile(`((?:HOST_A|HOST_B|GUEST|HOST|主持人甲|主持人乙|主持甲|主持乙|嘉宾|主持人|[A-Z][A-Z\s.]+)(?:：|:))`)
+	speakerTagRE      = regexp.MustCompile(`^(?:HOST_A|HOST_B|GUEST|HOST|主持人甲|主持人乙|主持甲|主持乙|嘉宾|主持人|[A-Z][A-Z\s.]+)(?:：|:)$`)
+	textUnitRE        = regexp.MustCompile(`[\p{Han}\p{Hiragana}\p{Katakana}\p{Hangul}]|[\p{L}\p{N}]+(?:['_-][\p{L}\p{N}]+)*`)
 )
 
 // DialoguePart is one speaker-labelled portion of a multi-voice script.
@@ -52,15 +53,18 @@ func NewRenderer(client gentts.Client) *Renderer {
 }
 
 // PreprocessForTTS normalizes generator markup into spoken text.
+//
+// Markup tags are shared between English and Chinese scripts; the replacement
+// values use punctuation that TTS engines on both languages interpret as
+// natural pauses or vocal colour rather than literal words.
 func PreprocessForTTS(text string) string {
 	replacer := strings.NewReplacer(
-		"[pause]", "...",
-		"[chuckle]", "heh...",
+		"[pause]", "……",
+		"[chuckle]", "呵……",
+		"[cough]", "咳……",
 		`"`, "",
 	)
-	text = replacer.Replace(text)
-	text = strings.ReplaceAll(text, "[cough]", "ahem...")
-	return strings.TrimSpace(text)
+	return strings.TrimSpace(replacer.Replace(text))
 }
 
 // SplitIntoChunks splits long scripts near sentence boundaries while keeping chunks near maxWords.
@@ -72,8 +76,7 @@ func SplitIntoChunks(script string, maxWords int) []string {
 	if maxWords <= 0 {
 		maxWords = defaultChunkWords
 	}
-	words := strings.Fields(script)
-	if len(words) <= maxWords {
+	if countTextUnits(script) <= maxWords {
 		return []string{script}
 	}
 
@@ -90,7 +93,16 @@ func SplitIntoChunks(script string, maxWords int) []string {
 		if sentence == "" {
 			continue
 		}
-		sentenceWords := len(strings.Fields(sentence))
+		sentenceWords := countTextUnits(sentence)
+		if sentenceWords > maxWords {
+			if len(current) > 0 {
+				chunks = append(chunks, strings.Join(current, " "))
+				current = nil
+				currentWords = 0
+			}
+			chunks = append(chunks, splitLongSegment(sentence, maxWords)...)
+			continue
+		}
 		if currentWords+sentenceWords > maxWords && len(current) > 0 {
 			chunks = append(chunks, strings.Join(current, " "))
 			current = []string{sentence}
@@ -126,7 +138,7 @@ func ParseDialogue(script string) []DialoguePart {
 	}
 
 	for i, match := range matches {
-		tag := strings.TrimSuffix(strings.TrimSpace(script[match[0]:match[1]]), ":")
+		tag := normalizeSpeakerTag(strings.TrimSpace(script[match[0]:match[1]]))
 		start := match[1]
 		end := len(script)
 		if i+1 < len(matches) {
@@ -174,7 +186,7 @@ func (r *Renderer) RenderMulti(ctx context.Context, script string, voices map[st
 		}
 		voice := speakerVoice(part.Speaker, hostVoice, guestVoice)
 		partPath := withStemSuffix(outputPath, fmt.Sprintf("_part%03d", i))
-		if len(strings.Fields(text)) > defaultChunkWords {
+		if countTextUnits(text) > defaultChunkWords {
 			if err := r.RenderSingle(ctx, text, voice, partPath); err != nil {
 				return err
 			}
@@ -311,8 +323,13 @@ func (r *Renderer) writeConcatList(outputPath string, files []string) (string, e
 	listFile := withSuffix(outputPath, ".concat.txt")
 	var builder strings.Builder
 	for _, file := range files {
+		abs, err := filepath.Abs(file)
+		if err != nil {
+			return "", fmt.Errorf("generator/renderer: resolve path %s: %w", file, err)
+		}
+		abs = filepath.ToSlash(abs)
 		builder.WriteString("file '")
-		builder.WriteString(strings.ReplaceAll(file, "'", "'\\''"))
+		builder.WriteString(strings.ReplaceAll(abs, "'", "\\'"))
 		builder.WriteString("'\n")
 	}
 	if err := os.WriteFile(listFile, []byte(builder.String()), 0o644); err != nil {
@@ -352,9 +369,9 @@ func (r *Renderer) cleanupFiles(paths []string) {
 
 func speakerVoice(speaker, hostVoice, guestVoice string) string {
 	switch speaker {
-	case "HOST", "HOST_A":
+	case "HOST", "HOST_A", "主持人", "主持人甲", "主持甲":
 		return hostVoice
-	case "GUEST", "HOST_B":
+	case "GUEST", "HOST_B", "嘉宾", "主持人乙", "主持乙":
 		return guestVoice
 	default:
 		return hostVoice
@@ -379,15 +396,64 @@ func moveFile(src, dst string) error {
 }
 
 func splitSentences(text string) []string {
-	matches := sentenceExtractRE.FindAllString(text, -1)
-	sentences := make([]string, 0, len(matches))
-	for _, match := range matches {
-		match = strings.TrimSpace(match)
-		if match != "" {
-			sentences = append(sentences, match)
+	var sentences []string
+	var current strings.Builder
+	for _, r := range text {
+		current.WriteRune(r)
+		if isSentenceBoundary(r) {
+			segment := strings.TrimSpace(current.String())
+			if segment != "" {
+				sentences = append(sentences, segment)
+			}
+			current.Reset()
 		}
 	}
+	if tail := strings.TrimSpace(current.String()); tail != "" {
+		sentences = append(sentences, tail)
+	}
 	return sentences
+}
+
+func splitLongSegment(text string, maxWords int) []string {
+	indexes := textUnitRE.FindAllStringIndex(text, -1)
+	if len(indexes) == 0 || len(indexes) <= maxWords {
+		return []string{strings.TrimSpace(text)}
+	}
+
+	chunks := make([]string, 0, (len(indexes)+maxWords-1)/maxWords)
+	start := 0
+	for i := maxWords; i < len(indexes); i += maxWords {
+		end := indexes[i-1][1]
+		chunk := strings.TrimSpace(text[start:end])
+		if chunk != "" {
+			chunks = append(chunks, chunk)
+		}
+		start = end
+	}
+	if tail := strings.TrimSpace(text[start:]); tail != "" {
+		chunks = append(chunks, tail)
+	}
+	return chunks
+}
+
+func countTextUnits(text string) int {
+	return len(textUnitRE.FindAllString(text, -1))
+}
+
+func isSentenceBoundary(r rune) bool {
+	switch r {
+	case '.', '!', '?', ';', '。', '！', '？', '；', '\n':
+		return true
+	default:
+		return false
+	}
+}
+
+func normalizeSpeakerTag(tag string) string {
+	tag = strings.TrimSpace(tag)
+	tag = strings.TrimSuffix(tag, ":")
+	tag = strings.TrimSuffix(tag, "：")
+	return tag
 }
 
 func firstNonEmpty(values ...string) string {

@@ -142,7 +142,7 @@ func runGenerate(ctx context.Context, cfg config, showID, segmentType, topic str
 		if err != nil {
 			return fmt.Errorf("segment %d: %w", i+1, err)
 		}
-		log.Printf("generator: wrote %s (%.1fs, %d words)", filepath.Base(result.AudioPath), result.Duration, result.WordCount)
+		log.Printf("generator: wrote %s (%.1fs, %d 字)", filepath.Base(result.AudioPath), result.Duration, result.WordCount)
 	}
 	return nil
 }
@@ -180,7 +180,7 @@ func runGenerateAll(ctx context.Context, cfg config, min int, segmentType string
 				log.Printf("generator: %s segment %d/%d failed: %v", show.ShowID, i+1, need, err)
 				continue
 			}
-			log.Printf("generator: %s wrote %s (%.1fs, %d words)", show.ShowID, filepath.Base(result.AudioPath), result.Duration, result.WordCount)
+			log.Printf("generator: %s wrote %s (%.1fs, %d 字)", show.ShowID, filepath.Base(result.AudioPath), result.Duration, result.WordCount)
 		}
 	}
 	return nil
@@ -203,16 +203,16 @@ func runStatus(cfg config, w io.Writer) error {
 }
 
 func runListTypes(w io.Writer) error {
-	keys := make([]string, 0, len(gen.SegmentWordTargets))
-	for key := range gen.SegmentWordTargets {
+	keys := make([]string, 0, len(gen.SegmentLengthTargets))
+	for key := range gen.SegmentLengthTargets {
 		keys = append(keys, key)
 	}
 	slices.Sort(keys)
 
-	fmt.Fprintf(w, "%-20s %s\n", "SEGMENT TYPE", "TARGET WORDS")
+	fmt.Fprintf(w, "%-20s %s\n", "SEGMENT TYPE", "TARGET CHARS")
 	fmt.Fprintf(w, "%s\n", strings.Repeat("-", 40))
 	for _, key := range keys {
-		target := gen.SegmentWordTargets[key]
+		target := gen.SegmentLengthTargets[key]
 		fmt.Fprintf(w, "%-20s %d-%d\n", key, target.Min, target.Max)
 	}
 	return nil

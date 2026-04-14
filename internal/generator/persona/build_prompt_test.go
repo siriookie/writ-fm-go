@@ -1,6 +1,8 @@
 package persona
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -18,7 +20,7 @@ func TestGetOperatorContext(t *testing.T) {
 	}
 }
 
-func TestBuildHostPrompt(t *testing.T) {
+func TestBuildHostPrompt_Golden(t *testing.T) {
 	t.Parallel()
 
 	builder := NewBuilderWithClock(func() time.Time {
@@ -35,15 +37,24 @@ func TestBuildHostPrompt(t *testing.T) {
 		t.Fatalf("BuildHostPrompt() error = %v", err)
 	}
 
-	for _, want := range []string{
-		"You are Signal",
-		"CURRENT SHOW: Signal Report",
-		"Segment Type: news_analysis",
-		"Time: 23:47 (night)",
-		"Current events decoded after dark.",
-	} {
-		if !strings.Contains(prompt, want) {
-			t.Fatalf("prompt missing %q:\n%s", want, prompt)
-		}
+	assertGolden(t, filepath.Join("testdata", "signal_host_prompt.golden"), prompt)
+}
+
+func assertGolden(t *testing.T, path string, got string) {
+	t.Helper()
+
+	wantBytes, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile(%q) error = %v", path, err)
+	}
+
+	normalize := func(s string) string {
+		return strings.ReplaceAll(strings.TrimSpace(s), "\r\n", "\n")
+	}
+
+	want := normalize(string(wantBytes))
+	got = normalize(got)
+	if got != want {
+		t.Fatalf("golden mismatch for %s\n--- want ---\n%s\n--- got ---\n%s", path, want, got)
 	}
 }

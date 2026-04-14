@@ -1,89 +1,59 @@
 package generator
 
 import (
+	"bytes"
+	"embed"
 	"fmt"
 	"math/rand"
+	"text/template"
 
 	"github.com/writ-fm/go/internal/generator/persona"
 )
 
-// WordTarget defines the acceptable output length range for a segment type.
-type WordTarget struct {
+//go:embed templates/*.tmpl
+var promptTemplateFS embed.FS
+
+var promptTemplates = template.Must(template.ParseFS(promptTemplateFS, "templates/*.tmpl"))
+
+// ScriptLengthTarget defines the acceptable output length range for a segment type.
+// For Chinese generation we use approximate character counts instead of word counts.
+type ScriptLengthTarget struct {
 	Min int
 	Max int
 }
 
-// SegmentWordTargets mirrors the Python generator's target ranges.
-var SegmentWordTargets = map[string]WordTarget{
-	"deep_dive":        {Min: 1500, Max: 2500},
-	"news_analysis":    {Min: 1500, Max: 2000},
-	"interview":        {Min: 2000, Max: 3000},
-	"panel":            {Min: 2000, Max: 3000},
-	"story":            {Min: 1500, Max: 2500},
-	"listener_mailbag": {Min: 1500, Max: 2000},
-	"music_essay":      {Min: 1500, Max: 2500},
-	"station_id":       {Min: 15, Max: 30},
-	"show_intro":       {Min: 80, Max: 150},
-	"show_outro":       {Min: 60, Max: 120},
+// WordTarget is kept as a compatibility alias for older callers.
+type WordTarget = ScriptLengthTarget
+
+// SegmentLengthTargets mirrors the intended spoken length for a segment type.
+var SegmentLengthTargets = map[string]ScriptLengthTarget{
+	"deep_dive":        {Min: 2200, Max: 3600},
+	"news_analysis":    {Min: 1800, Max: 3000},
+	"interview":        {Min: 2600, Max: 4200},
+	"panel":            {Min: 2600, Max: 4200},
+	"story":            {Min: 1800, Max: 3200},
+	"listener_mailbag": {Min: 1800, Max: 2800},
+	"music_essay":      {Min: 2200, Max: 3600},
+	"station_id":       {Min: 20, Max: 40},
+	"show_intro":       {Min: 120, Max: 220},
+	"show_outro":       {Min: 90, Max: 180},
 }
 
-// SegmentPrompts holds the task-level instruction for each segment type.
-var SegmentPrompts = map[string]string{
-	"deep_dive": `Write an extended exploration of this topic. Go deep.
-Build your central idea through stories, examples, tangents.
-Let one thought lead naturally to another. Circle back to earlier threads.
-Include specific details: years, names, places when relevant.
-Structure: open with a hook, develop through 3-4 connected ideas, land somewhere unexpected.
-Use [pause] for natural rhythm. Output ONLY the spoken words.`,
-	"news_analysis": `Analyze these headlines through a late-night lens.
-Don't just report - interpret. What patterns do you see? What's being missed?
-Connect current events to deeper themes. Ask the questions daytime anchors don't.
-Be thoughtful, not reactive. Skeptical but not cynical.
+// SegmentWordTargets is kept as a compatibility alias for older callers.
+var SegmentWordTargets = SegmentLengthTargets
 
-HEADLINES:
-%s
+type promptEnvelopeData struct {
+	BasePrompt  string
+	SegmentType string
+	Topic       string
+	TargetMin   int
+	TargetMax   int
+	TaskPrompt  string
+}
 
-Use [pause] for natural rhythm. Output ONLY the spoken words.`,
-	"interview": `Write a simulated interview where you (the host) talk with %s.
-Format with HOST: and GUEST: markers on separate lines.
-The guest is a fictional/composite character, not a real living person being impersonated.
-The conversation should feel natural - interruptions, tangents, moments of surprise.
-Build to genuine insight or revelation.
-Use [pause] for natural rhythm. Output ONLY the spoken dialogue.`,
-	"panel": `Write a discussion between two hosts on this topic.
-Format with HOST_A: and HOST_B: markers on separate lines.
-They have different perspectives but mutual respect.
-The conversation should build - start with disagreement, find nuance, reach unexpected common ground.
-Include moments of genuine surprise and humor.
-Use [pause] for natural rhythm. Output ONLY the spoken dialogue.`,
-	"story": `Tell a story. It can be true, apocryphal, or mythological - but tell it like it happened.
-Good stories have specific details: the color of the room, the year, the weather.
-Build tension. Let the listener wonder where this is going.
-The ending should reframe everything that came before.
-Use [pause] for dramatic effect. Output ONLY the spoken words.`,
-	"listener_mailbag": `Write a segment responding to invented listener messages.
-Create 2-3 messages from listeners (with first names and cities).
-Each message should touch on something real - a memory, a question, a feeling.
-Respond to each with genuine warmth and thoughtfulness.
-Format: read the message, then respond. Natural transitions between letters.
-Use [pause] for natural rhythm. Output ONLY the spoken words.`,
-	"music_essay": `Write an extended essay about music.
-This is not a review. It's a love letter, an excavation, a meditation.
-Pick a specific angle: a single song, a studio, a year, a collaboration, a genre's birth.
-Use vivid, sensory language. Make the listener hear what you're describing.
-Be specific with details but universal with feeling.
-Use [pause] for natural rhythm. Output ONLY the spoken words.`,
-	"station_id": `Write a 15-30 word station ID for WRIT-FM.
-Be cryptic but warm. Reference the frequency, the signal, the persistence of broadcasting.
-Output ONLY the spoken text. No quotes, headers, or explanations.`,
-	"show_intro": `Write an 80-150 word opening for the show.
-Welcome listeners. Set the mood. Hint at what's ahead without being specific.
-Ground the listener in time and space - what hour is it, what kind of night.
-Output ONLY the spoken text.`,
-	"show_outro": `Write a 60-120 word show closing.
-Thank the listener for staying. Acknowledge the time spent together.
-Hint at what's next on the station. Leave them with something to carry.
-Output ONLY the spoken text.`,
+type taskPromptData struct {
+	Headlines string
+	GuestName string
 }
 
 // BuildRequest is the input for prompt generation.
@@ -146,29 +116,41 @@ func (b *PromptBuilder) Build(req BuildRequest) (string, error) {
 		return "", err
 	}
 
-	target, ok := SegmentWordTargets[req.SegmentType]
+	target, ok := SegmentLengthTargets[req.SegmentType]
 	if !ok {
-		target = SegmentWordTargets["deep_dive"]
+		target = SegmentLengthTargets["deep_dive"]
 	}
 
-	segmentPrompt, topic := b.taskPrompt(req)
-	return fmt.Sprintf(`%s
+	taskPrompt, topic, err := b.taskPrompt(req)
+	if err != nil {
+		return "", err
+	}
 
-SEGMENT: %s
-TOPIC: %s
-TARGET LENGTH: %d-%d words
-
-%s`, base, req.SegmentType, topic, target.Min, target.Max, segmentPrompt), nil
+	var buf bytes.Buffer
+	if err := promptTemplates.ExecuteTemplate(&buf, "base_prompt.tmpl", promptEnvelopeData{
+		BasePrompt:  base,
+		SegmentType: req.SegmentType,
+		Topic:       topic,
+		TargetMin:   target.Min,
+		TargetMax:   target.Max,
+		TaskPrompt:  taskPrompt,
+	}); err != nil {
+		return "", fmt.Errorf("generator: render prompt envelope: %w", err)
+	}
+	return buf.String(), nil
 }
 
-func (b *PromptBuilder) taskPrompt(req BuildRequest) (string, string) {
+func (b *PromptBuilder) taskPrompt(req BuildRequest) (string, string, error) {
 	switch req.SegmentType {
 	case "news_analysis":
 		headlines := req.Headlines
 		if headlines == "" {
-			headlines = "No headlines available - discuss the nature of news itself."
+			headlines = "暂无新闻标题，请讨论“新闻”本身是如何塑造现实感的。"
 		}
-		return fmt.Sprintf(SegmentPrompts["news_analysis"], headlines), req.Topic
+		prompt, err := renderTaskTemplate("segment_news_analysis.tmpl", taskPromptData{
+			Headlines: headlines,
+		})
+		return prompt, req.Topic, err
 	case "interview":
 		guestName := req.GuestName
 		guestContext := req.GuestContext
@@ -177,16 +159,45 @@ func (b *PromptBuilder) taskPrompt(req BuildRequest) (string, string) {
 			guestName = guest.Name
 			guestContext = guest.Context
 		}
+		prompt, err := renderTaskTemplate("segment_interview.tmpl", taskPromptData{
+			GuestName: guestName,
+		})
 		topic := req.Topic
 		if guestContext != "" {
-			topic = fmt.Sprintf("%s (Guest context: %s)", topic, guestContext)
+			topic = fmt.Sprintf("%s（嘉宾背景：%s）", topic, guestContext)
 		}
-		return fmt.Sprintf(SegmentPrompts["interview"], guestName), topic
+		return prompt, topic, err
+	case "panel":
+		prompt, err := renderTaskTemplate("segment_panel.tmpl", nil)
+		return prompt, req.Topic, err
+	case "story":
+		prompt, err := renderTaskTemplate("segment_story.tmpl", nil)
+		return prompt, req.Topic, err
+	case "listener_mailbag":
+		prompt, err := renderTaskTemplate("segment_listener_mailbag.tmpl", nil)
+		return prompt, req.Topic, err
+	case "music_essay":
+		prompt, err := renderTaskTemplate("segment_music_essay.tmpl", nil)
+		return prompt, req.Topic, err
+	case "station_id":
+		prompt, err := renderTaskTemplate("segment_station_id.tmpl", nil)
+		return prompt, req.Topic, err
+	case "show_intro":
+		prompt, err := renderTaskTemplate("segment_show_intro.tmpl", nil)
+		return prompt, req.Topic, err
+	case "show_outro":
+		prompt, err := renderTaskTemplate("segment_show_outro.tmpl", nil)
+		return prompt, req.Topic, err
 	default:
-		prompt, ok := SegmentPrompts[req.SegmentType]
-		if !ok {
-			prompt = SegmentPrompts["deep_dive"]
-		}
-		return prompt, req.Topic
+		prompt, err := renderTaskTemplate("segment_deep_dive.tmpl", nil)
+		return prompt, req.Topic, err
 	}
+}
+
+func renderTaskTemplate(name string, data any) (string, error) {
+	var buf bytes.Buffer
+	if err := promptTemplates.ExecuteTemplate(&buf, name, data); err != nil {
+		return "", fmt.Errorf("generator: render task template %s: %w", name, err)
+	}
+	return buf.String(), nil
 }

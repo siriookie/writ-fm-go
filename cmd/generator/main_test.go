@@ -173,7 +173,7 @@ func TestRunListTopics(t *testing.T) {
 		t.Fatalf("runListTopics() error = %v", err)
 	}
 	out := buf.String()
-	if !strings.Contains(out, "[philosophy]") || !strings.Contains(out, "The archaeology of memory") {
+	if !strings.Contains(out, "[philosophy]") || !strings.Contains(out, "记忆考古学") {
 		t.Fatalf("unexpected output: %s", out)
 	}
 }

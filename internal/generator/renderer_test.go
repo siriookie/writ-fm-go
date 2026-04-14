@@ -30,8 +30,8 @@ func (f *fakeTTS) Synthesize(ctx context.Context, text, voice string, dst io.Wri
 func TestPreprocessForTTS(t *testing.T) {
 	t.Parallel()
 
-	got := PreprocessForTTS(`Hello [pause] "[chuckle]" [cough]`)
-	if got != "Hello ... heh... ahem..." {
+	got := PreprocessForTTS(`你好[pause]"[chuckle]"[cough]`)
+	if got != "你好……呵……咳……" {
 		t.Fatalf("PreprocessForTTS() = %q", got)
 	}
 }
@@ -49,14 +49,37 @@ func TestSplitIntoChunks(t *testing.T) {
 	}
 }
 
+func TestSplitIntoChunks_ChinesePunctuationAndUnits(t *testing.T) {
+	t.Parallel()
+
+	text := "深夜电台还亮着。城市已经睡了，但是还有人醒着。我们继续说下去。"
+	got := SplitIntoChunks(text, 12)
+	if len(got) < 2 {
+		t.Fatalf("len(chunks) = %d, want >= 2; chunks=%#v", len(got), got)
+	}
+	if got[0] != "深夜电台还亮着。" {
+		t.Fatalf("first chunk = %q", got[0])
+	}
+}
+
+func TestSplitIntoChunks_ChineseWithoutSpacesStillSplits(t *testing.T) {
+	t.Parallel()
+
+	text := "这是一个没有空格但是非常长的中文段落它应该在超过阈值之后被切开否则渲染时会把整段一次性丢给TTS后端"
+	got := SplitIntoChunks(text, 10)
+	if len(got) < 2 {
+		t.Fatalf("len(chunks) = %d, want >= 2; chunks=%#v", len(got), got)
+	}
+}
+
 func TestParseDialogue(t *testing.T) {
 	t.Parallel()
 
-	got := ParseDialogue("HOST: Hello there.\nGUEST: Hi.\nHOST_A: Again.")
+	got := ParseDialogue("主持人：你好。\n嘉宾：也向你问好。\n主持人甲：继续。")
 	if len(got) != 3 {
 		t.Fatalf("len(parts) = %d, want 3", len(got))
 	}
-	if got[1].Speaker != "GUEST" || got[1].Text != "Hi." {
+	if got[1].Speaker != "嘉宾" || got[1].Text != "也向你问好。" {
 		t.Fatalf("unexpected part %#v", got[1])
 	}
 }
@@ -91,7 +114,7 @@ func TestRenderMultiUsesSpeakerVoicesAndConcat(t *testing.T) {
 
 	t.Setenv("GO_WANT_RENDERER_HELPER", "1")
 
-	script := "HOST: hello there.\nGUEST: general kenobi."
+	script := "主持人：你好，夜行人。\n嘉宾：晚上好，我们开始吧。"
 	err := renderer.RenderMulti(context.Background(), script, map[string]string{
 		"host":  "am_michael",
 		"guest": "af_bella",
@@ -109,7 +132,7 @@ func TestRenderMultiUsesSpeakerVoicesAndConcat(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadFile() error = %v", err)
 	}
-	if !strings.Contains(string(data), "hello there.") || !strings.Contains(string(data), "general kenobi.") {
+	if !strings.Contains(string(data), "你好，夜行人。") || !strings.Contains(string(data), "晚上好，我们开始吧。") {
 		t.Fatalf("unexpected output %q", string(data))
 	}
 }
@@ -126,6 +149,17 @@ func TestDuration(t *testing.T) {
 	}
 	if seconds != 12.5 {
 		t.Fatalf("Duration() = %v", seconds)
+	}
+}
+
+func TestCountTextUnits_MixedLanguage(t *testing.T) {
+	t.Parallel()
+
+	if got := countTextUnits("hello world"); got != 2 {
+		t.Fatalf("countTextUnits(english) = %d, want 2", got)
+	}
+	if got := countTextUnits("你好世界"); got != 4 {
+		t.Fatalf("countTextUnits(chinese) = %d, want 4", got)
 	}
 }
 

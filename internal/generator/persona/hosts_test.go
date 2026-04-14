@@ -12,8 +12,8 @@ func TestGetHost(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetHost() error = %v", err)
 	}
-	if host.Name != "The Liminal Operator" {
-		t.Fatalf("host.Name = %q, want %q", host.Name, "The Liminal Operator")
+	if host.Name != "临界" {
+		t.Fatalf("host.Name = %q, want %q", host.Name, "临界")
 	}
 }
 
@@ -29,11 +29,23 @@ func TestGetHost_Unknown(t *testing.T) {
 func TestGetHostVoice(t *testing.T) {
 	t.Parallel()
 
-	voice, err := GetHostVoice("ember")
+	voice, err := GetHostVoice("ember", "kokoro")
 	if err != nil {
 		t.Fatalf("GetHostVoice() error = %v", err)
 	}
-	if voice != "af_bella" {
-		t.Fatalf("voice = %q, want %q", voice, "af_bella")
+	if voice != "zf_xiaobei" {
+		t.Fatalf("voice = %q, want %q", voice, "zf_xiaobei")
+	}
+}
+
+func TestGetHostVoice_BackendSpecific(t *testing.T) {
+	t.Parallel()
+
+	voice, err := GetHostVoice("signal", "microsoft")
+	if err != nil {
+		t.Fatalf("GetHostVoice() error = %v", err)
+	}
+	if voice != "zh_yunxi" {
+		t.Fatalf("voice = %q, want %q", voice, "zh_yunxi")
 	}
 }
