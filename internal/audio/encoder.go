@@ -2,9 +2,14 @@
 package audio
 
 import (
+	"bufio"
 	"fmt"
 	"io"
+	"net"
+	neturl "net/url"
 	"os/exec"
+	"strings"
+	"sync"
 	"time"
 )
 
@@ -25,9 +30,12 @@ const (
 // Input format expected on stdin: signed 16-bit little-endian, 44100 Hz, stereo.
 // Output format streamed to Icecast: MP3, 96 kbps.
 type Encoder struct {
-	cmd   *exec.Cmd
-	stdin io.WriteCloser
-	done  chan struct{} // closed when cmd.Wait() returns
+	cmd            *exec.Cmd
+	stdin          io.WriteCloser
+	done           chan struct{} // closed when cmd.Wait() returns
+	failed         chan struct{} // closed when stderr shows a terminal connection failure
+	failOnce       sync.Once
+	targetHostPort string
 }
 
 // Write sends raw PCM bytes to the encoder stdin. Satisfies io.Writer.
@@ -52,11 +60,21 @@ func (e *Encoder) Alive() bool {
 // ffmpeg exits within ~100 ms if it cannot reach the Icecast server, so
 // waiting 300 ms is enough to distinguish "connected" from "failed to connect".
 func (e *Encoder) WaitReady(d time.Duration) bool {
+	if e.targetHostPort != "" {
+		conn, err := net.DialTimeout("tcp", e.targetHostPort, minDuration(d, 500*time.Millisecond))
+		if err != nil {
+			return false
+		}
+		_ = conn.Close()
+	}
+
 	t := time.NewTimer(d)
 	defer t.Stop()
 	select {
 	case <-e.done:
 		return false // died before d elapsed
+	case <-e.failed:
+		return false
 	case <-t.C:
 		return e.Alive()
 	}
@@ -66,8 +84,22 @@ func (e *Encoder) WaitReady(d time.Duration) bool {
 // Safe to call after the process has already exited.
 func (e *Encoder) Close() error {
 	_ = e.stdin.Close() // signal EOF to ffmpeg; ignore broken-pipe on dead process
-	<-e.done            // wait for cmd.Wait() goroutine to finish
-	return nil
+
+	select {
+	case <-e.done:
+		return nil
+	case <-time.After(1500 * time.Millisecond):
+		if e.cmd.Process != nil {
+			_ = e.cmd.Process.Kill()
+		}
+	}
+
+	select {
+	case <-e.done:
+		return nil
+	case <-time.After(500 * time.Millisecond):
+		return fmt.Errorf("audio: encoder did not exit after close")
+	}
 }
 
 // NewEncoder starts a persistent ffmpeg encoder process that reads PCM from
@@ -81,19 +113,64 @@ func NewEncoder(url string) (*Encoder, error) {
 	if err != nil {
 		return nil, fmt.Errorf("audio: encoder stdin pipe: %w", err)
 	}
-	cmd.Stderr = io.Discard // suppress ffmpeg progress/warning output
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return nil, fmt.Errorf("audio: encoder stderr pipe: %w", err)
+	}
 
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("audio: start encoder: %w", err)
 	}
 
-	enc := &Encoder{cmd: cmd, stdin: stdin, done: make(chan struct{})}
+	enc := &Encoder{
+		cmd:            cmd,
+		stdin:          stdin,
+		done:           make(chan struct{}),
+		failed:         make(chan struct{}),
+		targetHostPort: icecastHostPort(url),
+	}
+	go enc.watchStderr(stderr)
 	go func() {
 		_ = cmd.Wait()
 		close(enc.done)
 	}()
 
 	return enc, nil
+}
+
+func (e *Encoder) watchStderr(stderr io.ReadCloser) {
+	defer stderr.Close()
+
+	scanner := bufio.NewScanner(stderr)
+	for scanner.Scan() {
+		line := strings.ToLower(scanner.Text())
+		if strings.Contains(line, "connection refused") ||
+			strings.Contains(line, "connection timed out") ||
+			strings.Contains(line, "server returned 401") ||
+			strings.Contains(line, "unauthorized") ||
+			strings.Contains(line, "error writing header") ||
+			strings.Contains(line, "input/output error") {
+			e.failOnce.Do(func() {
+				close(e.failed)
+			})
+			return
+		}
+	}
+}
+
+func icecastHostPort(raw string) string {
+	u, err := neturl.Parse(raw)
+	if err != nil {
+		return ""
+	}
+	return u.Host
+}
+
+func minDuration(a, b time.Duration) time.Duration {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // buildEncoderArgs constructs the ffmpeg argument slice for streaming PCM to
@@ -108,18 +185,18 @@ func NewEncoder(url string) (*Encoder, error) {
 func buildEncoderArgs(url string) []string {
 	return []string{
 		"ffmpeg", "-v", "warning",
-		"-re",                 // consume stdin at real-time rate
-		"-f", "s16le",         // input format: signed 16-bit little-endian PCM
-		"-ar", "44100",        // input sample rate: 44100 Hz
-		"-ac", "2",            // input channels: stereo
-		"-i", "-",             // read from stdin
-		"-acodec", "libmp3lame",         // encode output to MP3 using LAME
-		"-b:a", "96k",                   // output bitrate
-		"-content_type", "audio/mpeg",   // Icecast stream MIME type
+		"-re",         // consume stdin at real-time rate
+		"-f", "s16le", // input format: signed 16-bit little-endian PCM
+		"-ar", "44100", // input sample rate: 44100 Hz
+		"-ac", "2", // input channels: stereo
+		"-i", "-", // read from stdin
+		"-acodec", "libmp3lame", // encode output to MP3 using LAME
+		"-b:a", "96k", // output bitrate
+		"-content_type", "audio/mpeg", // Icecast stream MIME type
 		"-ice_name", icecastIceName,
 		"-ice_description", icecastIceDescription,
 		"-ice_genre", icecastIceGenre,
 		"-f", "mp3", // output container format
-		url,         // Icecast destination URL
+		url, // Icecast destination URL
 	}
 }
