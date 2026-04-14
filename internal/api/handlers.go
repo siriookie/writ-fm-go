@@ -34,15 +34,6 @@ func (s *Server) handleNowPlaying(w http.ResponseWriter, _ *http.Request) {
 	// Inject live listener count.
 	track.Listeners = listeners
 
-	// Update stats counters.
-	s.mu.Lock()
-	if track.Name != "" && track.Name != s.lastTrackName {
-		s.tracksPlayed++
-		s.lastTrackName = track.Name
-	}
-	s.totalListeners += int64(listeners)
-	s.mu.Unlock()
-
 	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
 	writeJSON(w, http.StatusOK, track)
 }
@@ -52,10 +43,10 @@ func (s *Server) handleNowPlaying(w http.ResponseWriter, _ *http.Request) {
 // ---------------------------------------------------------------------------
 
 type healthResponse struct {
-	Status     string                    `json:"status"`
-	Timestamp  time.Time                 `json:"timestamp"`
+	Status     string                     `json:"status"`
+	Timestamp  time.Time                  `json:"timestamp"`
 	Components map[string]componentStatus `json:"components"`
-	UptimeSecs int64                     `json:"uptime_seconds"`
+	UptimeSecs int64                      `json:"uptime_seconds"`
 }
 
 type componentStatus struct {
@@ -114,10 +105,10 @@ type showSummary struct {
 }
 
 type upcomingShow struct {
-	ShowID      string `json:"show_id"`
-	Name        string `json:"name"`
-	Host        string `json:"host"`
-	TopicFocus  string `json:"topic_focus"`
+	ShowID       string `json:"show_id"`
+	Name         string `json:"name"`
+	Host         string `json:"host"`
+	TopicFocus   string `json:"topic_focus"`
 	StartsAround string `json:"starts_around"`
 }
 
@@ -177,12 +168,12 @@ func buildUpcoming(sched ScheduleResolver, now time.Time) []upcomingShow {
 // ---------------------------------------------------------------------------
 
 type statsResponse struct {
-	Uptime             string    `json:"uptime"`
-	UptimeSecs         int64     `json:"uptime_seconds"`
-	TracksPlayed       int       `json:"tracks_played"`
-	TotalListenersServed int64   `json:"total_listeners_served"`
-	CurrentListeners   int       `json:"current_listeners"`
-	APIStarted         time.Time `json:"api_started"`
+	Uptime               string    `json:"uptime"`
+	UptimeSecs           int64     `json:"uptime_seconds"`
+	TracksPlayed         int       `json:"tracks_played"`
+	TotalListenersServed int64     `json:"total_listeners_served"`
+	CurrentListeners     int       `json:"current_listeners"`
+	APIStarted           time.Time `json:"api_started"`
 }
 
 func (s *Server) handleStats(w http.ResponseWriter, _ *http.Request) {
@@ -190,16 +181,13 @@ func (s *Server) handleStats(w http.ResponseWriter, _ *http.Request) {
 	hours := int(uptime.Hours())
 	minutes := int(uptime.Minutes()) % 60
 
-	s.mu.Lock()
-	played := s.tracksPlayed
-	total := s.totalListeners
-	s.mu.Unlock()
+	snapshot := s.stats.Snapshot()
 
 	writeJSON(w, http.StatusOK, statsResponse{
 		Uptime:               fmt.Sprintf("%dh %dm", hours, minutes),
 		UptimeSecs:           int64(uptime.Seconds()),
-		TracksPlayed:         played,
-		TotalListenersServed: total,
+		TracksPlayed:         snapshot.TracksPlayed,
+		TotalListenersServed: snapshot.TotalListenersServed,
 		CurrentListeners:     s.lc.get(),
 		APIStarted:           s.startedAt,
 	})

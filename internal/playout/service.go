@@ -1,7 +1,8 @@
-package streamer
+package playout
 
 import (
 	"context"
+	"io"
 	"log"
 	"math/rand"
 	"os"
@@ -15,21 +16,61 @@ import (
 	"github.com/writ-fm/go/internal/store"
 )
 
-func runPlaybackLoop(
-	ctx context.Context,
+const (
+	encoderReadyTimeout  = 300 * time.Millisecond
+	encoderRestartDelay  = 2 * time.Second
+	emptyQueueDelay      = 30 * time.Second
+	bumpersPerTalk       = 3
+	silenceChunkInterval = 100 * time.Millisecond
+	silenceChunkSize     = 44100 * 2 * 2 / 10
+)
+
+// TrackPublisher is the playout-side consumer contract for now-playing events.
+type TrackPublisher interface {
+	Publish(nowplaying.Track) error
+}
+
+// Service orchestrates the station playout loop. It owns the business workflow
+// that resolves shows, consumes queued talk segments, inserts bumpers, and
+// publishes listener-facing now-playing state.
+type Service struct {
+	icecastURL string
+	sched      *scheduler.StationSchedule
+	talks      *store.TalkStore
+	bumpers    *store.BumperStore
+	ctrl       *control.Controller
+	publisher  TrackPublisher
+	timeNow    func() time.Time
+}
+
+// New returns a playout service wired with the required collaborators.
+func New(
 	icecastURL string,
 	sched *scheduler.StationSchedule,
 	talks *store.TalkStore,
 	bumpers *store.BumperStore,
 	ctrl *control.Controller,
-	state *nowplaying.State,
-) {
+	publisher TrackPublisher,
+) *Service {
+	return &Service{
+		icecastURL: icecastURL,
+		sched:      sched,
+		talks:      talks,
+		bumpers:    bumpers,
+		ctrl:       ctrl,
+		publisher:  publisher,
+		timeNow:    time.Now,
+	}
+}
+
+// Run starts the persistent encoder lifecycle and blocks until ctx is cancelled.
+func (s *Service) Run(ctx context.Context) {
 	for {
 		if ctx.Err() != nil {
 			return
 		}
 
-		enc, err := audio.NewEncoder(icecastURL)
+		enc, err := audio.NewEncoder(s.icecastURL)
 		if err != nil {
 			log.Printf("streamer: start encoder: %v", err)
 			contextSleep(ctx, encoderRestartDelay)
@@ -37,14 +78,14 @@ func runPlaybackLoop(
 		}
 
 		if !enc.WaitReady(encoderReadyTimeout) {
-			log.Printf("streamer: encoder failed to connect to Icecast (URL=%s)", icecastURL)
+			log.Printf("streamer: encoder failed to connect to Icecast (URL=%s)", s.icecastURL)
 			_ = enc.Close()
 			contextSleep(ctx, encoderRestartDelay)
 			continue
 		}
 
-		log.Printf("streamer: encoder connected to %s", icecastURL)
-		runInner(ctx, enc, sched, talks, bumpers, ctrl, state)
+		log.Printf("streamer: encoder connected to %s", s.icecastURL)
+		s.runInner(ctx, enc)
 		_ = enc.Close()
 
 		if ctx.Err() != nil {
@@ -55,18 +96,7 @@ func runPlaybackLoop(
 	}
 }
 
-// runInner plays talk segments interleaved with bumpers until ctx is cancelled
-// or the encoder process dies. Each talk segment is deleted after playback
-// (consume-queue semantics). Bumpers are kept in the pool for reuse.
-func runInner(
-	ctx context.Context,
-	enc *audio.Encoder,
-	sched *scheduler.StationSchedule,
-	talks *store.TalkStore,
-	bumpers *store.BumperStore,
-	ctrl *control.Controller,
-	state *nowplaying.State,
-) {
+func (s *Service) runInner(ctx context.Context, enc *audio.Encoder) {
 	var lastBumperPath string
 
 	for {
@@ -74,14 +104,14 @@ func runInner(
 			return
 		}
 
-		show, err := sched.Resolve(timeNow())
+		show, err := s.sched.Resolve(s.timeNow())
 		if err != nil {
 			log.Printf("streamer: resolve schedule: %v", err)
 			pipeSilence(ctx, enc, emptyQueueDelay)
 			continue
 		}
 
-		segs, err := talks.List(show.ShowID)
+		segs, err := s.talks.List(show.ShowID)
 		if err != nil {
 			log.Printf("streamer: list talk segments for show %q: %v", show.ShowID, err)
 			pipeSilence(ctx, enc, emptyQueueDelay)
@@ -95,21 +125,20 @@ func runInner(
 
 		seg := segs[0]
 		segBase := filepath.Base(seg.Path)
-
-		if err := state.Update(nowplaying.Track{
-				ShowID:      show.ShowID,
-				ShowName:    show.Name,
-				Type:        "talk",
-				Name:        nowplaying.CleanName(segBase, true),
-				Host:        show.Host,
-				SegmentType: nowplaying.ExtractSegmentType(segBase),
-				UpdatedAt:   timeNow(),
-			}); err != nil {
-				log.Printf("streamer: write now-playing: %v", err)
-			}
+		if err := s.publisher.Publish(nowplaying.Track{
+			ShowID:      show.ShowID,
+			ShowName:    show.Name,
+			Type:        "talk",
+			Name:        nowplaying.CleanName(segBase, true),
+			Host:        show.Host,
+			SegmentType: nowplaying.ExtractSegmentType(segBase),
+			UpdatedAt:   s.timeNow(),
+		}); err != nil {
+			log.Printf("streamer: write now-playing: %v", err)
+		}
 
 		log.Printf("streamer: playing talk %s", seg.Path)
-		skipCh := ctrl.NextSegment()
+		skipCh := s.ctrl.NextSegment()
 		if err := pipeDecode(seg.Path, audio.DecodeOptions{IsSpeech: true}, enc, skipCh); err != nil {
 			log.Printf("streamer: pipe talk %s: %v", seg.Path, err)
 		}
@@ -126,7 +155,7 @@ func runInner(
 			if ctx.Err() != nil || !enc.Alive() {
 				return
 			}
-			bumper, err := bumpers.Pick(show.ShowID, lastBumperPath)
+			bumper, err := s.bumpers.Pick(show.ShowID, lastBumperPath)
 			if err != nil {
 				log.Printf("streamer: pick bumper: %v", err)
 				break
@@ -135,14 +164,14 @@ func runInner(
 				break
 			}
 
-			if err := state.Update(nowplaying.Track{
+			if err := s.publisher.Publish(nowplaying.Track{
 				ShowID:      show.ShowID,
 				ShowName:    show.Name,
 				Type:        "bumper",
 				Name:        bumperDisplayName(bumper),
 				AIGenerated: bumper.Caption != "" || bumper.DisplayName != "",
 				Caption:     bumper.Caption,
-				UpdatedAt:   timeNow(),
+				UpdatedAt:   s.timeNow(),
 			}); err != nil {
 				log.Printf("streamer: write now-playing: %v", err)
 			}
@@ -158,12 +187,6 @@ func runInner(
 	}
 }
 
-var timeNow = func() time.Time {
-	return time.Now()
-}
-
-// pipeDecode starts a decoder for path and pipes it to enc.
-// skip may be nil (pass-through from Pipe: nil means never skip).
 func pipeDecode(path string, opts audio.DecodeOptions, enc *audio.Encoder, skip <-chan struct{}) error {
 	dec, err := audio.NewDecoder(path, opts)
 	if err != nil {
@@ -172,11 +195,37 @@ func pipeDecode(path string, opts audio.DecodeOptions, enc *audio.Encoder, skip 
 	return audio.Pipe(dec, enc, skip)
 }
 
-// bumperDisplayName returns a listener-facing display name for a bumper.
-// Prefers the metadata DisplayName; falls back to "AI Music".
 func bumperDisplayName(b *store.BumperTrack) string {
 	if b.DisplayName != "" {
 		return b.DisplayName
 	}
 	return "AI Music"
+}
+
+type silencePiper interface {
+	io.Writer
+	Alive() bool
+}
+
+func pipeSilence(ctx context.Context, w silencePiper, d time.Duration) {
+	chunk := make([]byte, silenceChunkSize)
+	deadline := time.Now().Add(d)
+	for time.Now().Before(deadline) {
+		if ctx.Err() != nil || !w.Alive() {
+			return
+		}
+		if _, err := w.Write(chunk); err != nil {
+			return
+		}
+		contextSleep(ctx, silenceChunkInterval)
+	}
+}
+
+func contextSleep(ctx context.Context, d time.Duration) {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-t.C:
+	case <-ctx.Done():
+	}
 }

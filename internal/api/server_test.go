@@ -12,6 +12,7 @@ import (
 
 	"github.com/writ-fm/go/internal/domain"
 	"github.com/writ-fm/go/internal/nowplaying"
+	"github.com/writ-fm/go/internal/stats"
 )
 
 // ---------------------------------------------------------------------------
@@ -31,12 +32,15 @@ func (f *fakeSchedule) Resolve(_ time.Time) (*domain.ResolvedShow, error) {
 	return f.show, f.err
 }
 
-type fakeListeners struct{ n int; err error }
+type fakeListeners struct {
+	n   int
+	err error
+}
 
 func (f *fakeListeners) Listeners(_ string) (int, error) { return f.n, f.err }
 
 // newTestServer builds a Server wired with the given fakes and a temp messages file.
-func newTestServer(t *testing.T, state TrackState, sched ScheduleResolver, lc ListenerCounter) *Server {
+func newTestServer(t *testing.T, state TrackState, sched ScheduleResolver, lc ListenerCounter) (*Server, *stats.Tracker) {
 	t.Helper()
 	dir := t.TempDir()
 	cfg := Config{
@@ -44,7 +48,8 @@ func newTestServer(t *testing.T, state TrackState, sched ScheduleResolver, lc Li
 		Mount:        "/stream",
 		MessagesFile: filepath.Join(dir, "messages.json"),
 	}
-	return New(cfg, state, sched, lc)
+	tracker := stats.NewTracker()
+	return New(cfg, state, sched, lc, tracker), tracker
 }
 
 func defaultShow() *domain.ResolvedShow {
@@ -73,7 +78,7 @@ func TestHandleNowPlaying_ReturnsTrackJSON(t *testing.T) {
 		SegmentType: "deep_dive",
 		UpdatedAt:   time.Now(),
 	}
-	srv := newTestServer(t, &fakeState{track}, &fakeSchedule{show: defaultShow()}, &fakeListeners{n: 3})
+	srv, _ := newTestServer(t, &fakeState{track}, &fakeSchedule{show: defaultShow()}, &fakeListeners{n: 3})
 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/now-playing", nil)
@@ -99,7 +104,7 @@ func TestHandleNowPlaying_ReturnsTrackJSON(t *testing.T) {
 }
 
 func TestHandleNowPlaying_RootAliasWorks(t *testing.T) {
-	srv := newTestServer(t, &fakeState{}, &fakeSchedule{show: defaultShow()}, &fakeListeners{})
+	srv, _ := newTestServer(t, &fakeState{}, &fakeSchedule{show: defaultShow()}, &fakeListeners{})
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	w := httptest.NewRecorder()
 	srv.router.ServeHTTP(w, req)
@@ -109,7 +114,7 @@ func TestHandleNowPlaying_RootAliasWorks(t *testing.T) {
 }
 
 func TestHandleNowPlaying_HasNoCacheHeader(t *testing.T) {
-	srv := newTestServer(t, &fakeState{}, &fakeSchedule{show: defaultShow()}, &fakeListeners{})
+	srv, _ := newTestServer(t, &fakeState{}, &fakeSchedule{show: defaultShow()}, &fakeListeners{})
 	req := httptest.NewRequest(http.MethodGet, "/now-playing", nil)
 	w := httptest.NewRecorder()
 	srv.router.ServeHTTP(w, req)
@@ -119,24 +124,17 @@ func TestHandleNowPlaying_HasNoCacheHeader(t *testing.T) {
 	}
 }
 
-func TestHandleNowPlaying_TracksPlayed_Increments(t *testing.T) {
-	srv := newTestServer(t, &fakeState{nowplaying.Track{Name: "Track A"}},
+func TestHandleNowPlaying_DoesNotMutateTrackStats(t *testing.T) {
+	srv, tracker := newTestServer(t, &fakeState{nowplaying.Track{Name: "Track A"}},
 		&fakeSchedule{show: defaultShow()}, &fakeListeners{})
 
 	for range 3 {
 		srv.router.ServeHTTP(httptest.NewRecorder(),
 			httptest.NewRequest(http.MethodGet, "/now-playing", nil))
 	}
-	srv.state = &fakeState{nowplaying.Track{Name: "Track B"}}
-	srv.router.ServeHTTP(httptest.NewRecorder(),
-		httptest.NewRequest(http.MethodGet, "/now-playing", nil))
 
-	srv.mu.Lock()
-	played := srv.tracksPlayed
-	srv.mu.Unlock()
-
-	if played != 2 {
-		t.Errorf("tracksPlayed = %d, want 2", played)
+	if got := tracker.Snapshot().TracksPlayed; got != 0 {
+		t.Errorf("tracksPlayed = %d, want 0 without playout events", got)
 	}
 }
 
@@ -145,7 +143,7 @@ func TestHandleNowPlaying_TracksPlayed_Increments(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestHandleHealth_HealthyWhenIcecastUp(t *testing.T) {
-	srv := newTestServer(t, &fakeState{}, &fakeSchedule{show: defaultShow()}, &fakeListeners{n: 1})
+	srv, _ := newTestServer(t, &fakeState{}, &fakeSchedule{show: defaultShow()}, &fakeListeners{n: 1})
 	req := httptest.NewRequest(http.MethodGet, "/health", nil)
 	w := httptest.NewRecorder()
 	srv.router.ServeHTTP(w, req)
@@ -166,7 +164,7 @@ func TestHandleHealth_HealthyWhenIcecastUp(t *testing.T) {
 }
 
 func TestHandleHealth_DegradedWhenIcecastDown(t *testing.T) {
-	srv := newTestServer(t, &fakeState{}, &fakeSchedule{show: defaultShow()},
+	srv, _ := newTestServer(t, &fakeState{}, &fakeSchedule{show: defaultShow()},
 		&fakeListeners{err: fmt.Errorf("connection refused")})
 	req := httptest.NewRequest(http.MethodGet, "/health", nil)
 	w := httptest.NewRecorder()
@@ -180,7 +178,7 @@ func TestHandleHealth_DegradedWhenIcecastDown(t *testing.T) {
 }
 
 func TestHandleHealth_UptimeIncreases(t *testing.T) {
-	srv := newTestServer(t, &fakeState{}, &fakeSchedule{show: defaultShow()}, &fakeListeners{})
+	srv, _ := newTestServer(t, &fakeState{}, &fakeSchedule{show: defaultShow()}, &fakeListeners{})
 	srv.startedAt = time.Now().Add(-10 * time.Second)
 
 	req := httptest.NewRequest(http.MethodGet, "/health", nil)
@@ -200,7 +198,7 @@ func TestHandleHealth_UptimeIncreases(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestHandleSchedule_ReturnsCurrent(t *testing.T) {
-	srv := newTestServer(t, &fakeState{}, &fakeSchedule{show: defaultShow()}, &fakeListeners{})
+	srv, _ := newTestServer(t, &fakeState{}, &fakeSchedule{show: defaultShow()}, &fakeListeners{})
 	req := httptest.NewRequest(http.MethodGet, "/schedule", nil)
 	w := httptest.NewRecorder()
 	srv.router.ServeHTTP(w, req)
@@ -220,7 +218,7 @@ func TestHandleSchedule_ReturnsCurrent(t *testing.T) {
 }
 
 func TestHandleSchedule_ErrorReturns500(t *testing.T) {
-	srv := newTestServer(t, &fakeState{},
+	srv, _ := newTestServer(t, &fakeState{},
 		&fakeSchedule{err: fmt.Errorf("no schedule block")}, &fakeListeners{})
 	req := httptest.NewRequest(http.MethodGet, "/schedule", nil)
 	w := httptest.NewRecorder()
@@ -235,7 +233,9 @@ func TestHandleSchedule_ErrorReturns500(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestHandleStats_Fields(t *testing.T) {
-	srv := newTestServer(t, &fakeState{}, &fakeSchedule{show: defaultShow()}, &fakeListeners{n: 5})
+	srv, tracker := newTestServer(t, &fakeState{}, &fakeSchedule{show: defaultShow()}, &fakeListeners{n: 5})
+	_ = tracker.Publish(nowplaying.Track{Name: "Track A"})
+	tracker.RecordListeners(7)
 	req := httptest.NewRequest(http.MethodGet, "/stats", nil)
 	w := httptest.NewRecorder()
 	srv.router.ServeHTTP(w, req)
@@ -253,6 +253,12 @@ func TestHandleStats_Fields(t *testing.T) {
 	if got["current_listeners"].(float64) != 5 {
 		t.Errorf("current_listeners = %v, want 5", got["current_listeners"])
 	}
+	if got["tracks_played"].(float64) != 1 {
+		t.Errorf("tracks_played = %v, want 1", got["tracks_played"])
+	}
+	if got["total_listeners_served"].(float64) != 7 {
+		t.Errorf("total_listeners_served = %v, want 7", got["total_listeners_served"])
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -260,7 +266,7 @@ func TestHandleStats_Fields(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestHandlePostMessage_Accepted(t *testing.T) {
-	srv := newTestServer(t, &fakeState{}, &fakeSchedule{show: defaultShow()}, &fakeListeners{})
+	srv, _ := newTestServer(t, &fakeState{}, &fakeSchedule{show: defaultShow()}, &fakeListeners{})
 	body := `{"message":"Hello from a listener!"}`
 	req := httptest.NewRequest(http.MethodPost, "/message", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
@@ -278,7 +284,7 @@ func TestHandlePostMessage_Accepted(t *testing.T) {
 }
 
 func TestHandlePostMessage_TooLong(t *testing.T) {
-	srv := newTestServer(t, &fakeState{}, &fakeSchedule{show: defaultShow()}, &fakeListeners{})
+	srv, _ := newTestServer(t, &fakeState{}, &fakeSchedule{show: defaultShow()}, &fakeListeners{})
 	msg := strings.Repeat("x", 281)
 	body := fmt.Sprintf(`{"message":%q}`, msg)
 	req := httptest.NewRequest(http.MethodPost, "/message", strings.NewReader(body))
@@ -290,7 +296,7 @@ func TestHandlePostMessage_TooLong(t *testing.T) {
 }
 
 func TestHandlePostMessage_RateLimited(t *testing.T) {
-	srv := newTestServer(t, &fakeState{}, &fakeSchedule{show: defaultShow()}, &fakeListeners{})
+	srv, _ := newTestServer(t, &fakeState{}, &fakeSchedule{show: defaultShow()}, &fakeListeners{})
 	body := `{"message":"first"}`
 	makeReq := func() *http.Request {
 		r := httptest.NewRequest(http.MethodPost, "/message", strings.NewReader(body))
@@ -308,7 +314,7 @@ func TestHandlePostMessage_RateLimited(t *testing.T) {
 }
 
 func TestHandleGetMessages_ReturnsMessages(t *testing.T) {
-	srv := newTestServer(t, &fakeState{}, &fakeSchedule{show: defaultShow()}, &fakeListeners{})
+	srv, _ := newTestServer(t, &fakeState{}, &fakeSchedule{show: defaultShow()}, &fakeListeners{})
 
 	// Post a message first.
 	body := `{"message":"test message"}`
@@ -343,7 +349,7 @@ func TestHandleGetMessages_ReturnsMessages(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestCORSHeaders(t *testing.T) {
-	srv := newTestServer(t, &fakeState{}, &fakeSchedule{show: defaultShow()}, &fakeListeners{})
+	srv, _ := newTestServer(t, &fakeState{}, &fakeSchedule{show: defaultShow()}, &fakeListeners{})
 	req := httptest.NewRequest(http.MethodGet, "/now-playing", nil)
 	w := httptest.NewRecorder()
 	srv.router.ServeHTTP(w, req)

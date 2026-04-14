@@ -8,6 +8,11 @@ import (
 	"time"
 )
 
+// Sink consumes now-playing updates.
+type Sink interface {
+	Publish(Track) error
+}
+
 // Track is the now-playing state written to disk as JSON.
 //
 // JSON field names match the Python api_server.py / stream_gapless.py schema so
@@ -35,6 +40,21 @@ type Track struct {
 	// Runtime state.
 	Listeners int       `json:"listeners"`
 	UpdatedAt time.Time `json:"timestamp"`
+}
+
+// JSONSink writes now-playing updates to a JSON file.
+type JSONSink struct {
+	path string
+}
+
+// NewJSONSink returns a sink that atomically writes each track update to path.
+func NewJSONSink(path string) *JSONSink {
+	return &JSONSink{path: path}
+}
+
+// Publish writes t to disk atomically.
+func (s *JSONSink) Publish(t Track) error {
+	return Write(s.path, t)
 }
 
 // Write atomically writes t as JSON to path.

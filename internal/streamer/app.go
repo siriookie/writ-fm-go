@@ -13,15 +13,14 @@ import (
 	"github.com/writ-fm/go/internal/control"
 	"github.com/writ-fm/go/internal/icecast"
 	"github.com/writ-fm/go/internal/nowplaying"
+	"github.com/writ-fm/go/internal/playout"
 	"github.com/writ-fm/go/internal/scheduler"
+	"github.com/writ-fm/go/internal/stats"
 	"github.com/writ-fm/go/internal/store"
 )
 
 const (
-	encoderReadyTimeout  = 300 * time.Millisecond // ffmpeg exits within ~100 ms if Icecast unreachable
-	encoderRestartDelay  = 2 * time.Second
-	emptyQueueDelay      = 30 * time.Second
-	bumpersPerTalk       = 3 // minimum bumpers between talk segments; rand adds 0 or 1 more
+	encoderRestartDelay  = 2 * time.Second // kept in streamer for lifecycle tests and shutdown timing
 	silenceChunkInterval = 100 * time.Millisecond
 	silenceChunkSize     = 44100 * 2 * 2 / 10 // 17640 bytes = 0.1 s of s16le stereo 44100 Hz
 )
@@ -61,8 +60,16 @@ func Run(ctx context.Context, cfg Config) {
 		stopper.Wait()
 	}()
 
-	// Shared now-playing state: written by the playback loop, read by the API server.
-	state := nowplaying.NewState(cfg.NowPlayingPath)
+	tracker := stats.NewTracker()
+
+	var sinks []nowplaying.Sink
+	if cfg.NowPlayingPath != "" {
+		sinks = append(sinks, nowplaying.NewJSONSink(cfg.NowPlayingPath))
+	}
+	sinks = append(sinks, tracker)
+
+	// Shared now-playing state: written by the playout service, read by the API server.
+	state := nowplaying.NewStateWithSinks(sinks...)
 
 	ctrl := control.NewController()
 	if cfg.ControlAddr != "" {
@@ -99,14 +106,14 @@ func Run(ctx context.Context, cfg Config) {
 			Mount:        icecastMount(cfg.IcecastURL),
 			MessagesFile: messagesFile,
 		}
-		apiSrv := api.New(apiCfg, state, sched, ic)
+		apiSrv := api.New(apiCfg, state, sched, ic, tracker)
 		if err := stopper.Go("api-server", apiSrv.Run); err != nil {
 			log.Fatalf("streamer: start api server: %v", err)
 		}
 		log.Printf("streamer: API server listening on %s", cfg.APIAddr)
 	}
 
-	runPlaybackLoop(stopper.Context(), cfg.IcecastURL, sched, talks, bumpers, ctrl, state)
+	playout.New(cfg.IcecastURL, sched, talks, bumpers, ctrl, state).Run(stopper.Context())
 }
 
 // pipeSilence writes zero-filled PCM chunks to w for duration d, keeping the

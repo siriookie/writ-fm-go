@@ -16,11 +16,13 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/writ-fm/go/internal/domain"
 	"github.com/writ-fm/go/internal/nowplaying"
+	"github.com/writ-fm/go/internal/stats"
 )
 
 const (
 	apiShutdownTimeout  = 5 * time.Second
 	listenerCacheTTL    = 15 * time.Second
+	listenerSampleEvery = 15 * time.Second
 )
 
 // ---------------------------------------------------------------------------
@@ -43,6 +45,12 @@ type ScheduleResolver interface {
 // Implemented by *icecast.Client.
 type ListenerCounter interface {
 	Listeners(mountpoint string) (int, error)
+}
+
+// StatsTracker stores playout-facing metrics for the API.
+type StatsTracker interface {
+	Snapshot() stats.Snapshot
+	RecordListeners(int)
 }
 
 // ---------------------------------------------------------------------------
@@ -68,24 +76,24 @@ type Server struct {
 	lc       *cachedListenerCounter
 	messages *messageStore
 	router   http.Handler
+	stats    StatsTracker
 
 	startedAt time.Time
-
-	mu             sync.Mutex
-	tracksPlayed   int
-	lastTrackName  string
-	totalListeners int64
 }
 
 // New creates a Server with all dependencies injected.
 // listeners may be nil; listener count will always be 0 in that case.
-func New(cfg Config, state TrackState, sched ScheduleResolver, listeners ListenerCounter) *Server {
+func New(cfg Config, state TrackState, sched ScheduleResolver, listeners ListenerCounter, tracker StatsTracker) *Server {
+	if tracker == nil {
+		tracker = stats.NewTracker()
+	}
 	s := &Server{
-		cfg:      cfg,
-		state:    state,
-		sched:    sched,
-		lc:       newCachedListenerCounter(listeners, cfg.Mount, listenerCacheTTL),
-		messages: newMessageStore(cfg.MessagesFile),
+		cfg:       cfg,
+		state:     state,
+		sched:     sched,
+		lc:        newCachedListenerCounter(listeners, cfg.Mount, listenerCacheTTL),
+		messages:  newMessageStore(cfg.MessagesFile),
+		stats:     tracker,
 		startedAt: time.Now(),
 	}
 	s.router = s.buildRouter()
@@ -132,12 +140,30 @@ func (s *Server) Run(ctx context.Context) error {
 		_ = srv.Shutdown(shutCtx)
 	}()
 
+	go s.sampleListeners(ctx)
+
 	err = srv.Serve(ln)
 	<-shutdownDone
 	if errors.Is(err, http.ErrServerClosed) {
 		return nil
 	}
 	return err
+}
+
+func (s *Server) sampleListeners(ctx context.Context) {
+	ticker := time.NewTicker(listenerSampleEvery)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			if s.stats != nil {
+				s.stats.RecordListeners(s.lc.get())
+			}
+		case <-ctx.Done():
+			return
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------
