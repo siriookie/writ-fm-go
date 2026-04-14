@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"errors"
-	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -12,6 +11,8 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+
+	"github.com/spf13/cobra"
 
 	"github.com/writ-fm/go/internal/musicgen"
 	"github.com/writ-fm/go/internal/scheduler"
@@ -39,33 +40,70 @@ func configFromEnv() config {
 	return config{MusicGenURL: url, OutputDir: dir, SchedulePath: sched}
 }
 
+var (
+	showFlag  string
+	countFlag int
+	minFlag   int
+)
+
+var rootCmd = &cobra.Command{
+	Use:   "musicgen",
+	Short: "WRIT-FM bumper generation tool",
+}
+
+var generateCmd = &cobra.Command{
+	Use:   "generate",
+	Short: "Generate bumpers for a single show",
+	RunE: func(cmd *cobra.Command, args []string) error {
+		if showFlag == "" {
+			return errors.New("--show is required")
+		}
+		if countFlag <= 0 {
+			return errors.New("--count must be greater than 0")
+		}
+
+		cfg := configFromEnv()
+		ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+		defer stop()
+
+		return runGenerate(ctx, cfg, showFlag, countFlag)
+	},
+}
+
+var generateAllCmd = &cobra.Command{
+	Use:   "generate-all",
+	Short: "Generate bumpers for all shows up to a minimum count",
+	RunE: func(cmd *cobra.Command, args []string) error {
+		if minFlag <= 0 {
+			return errors.New("--min must be greater than 0")
+		}
+
+		cfg := configFromEnv()
+		ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+		defer stop()
+
+		return runGenerateAll(ctx, cfg, minFlag)
+	},
+}
+
+var statusCmd = &cobra.Command{
+	Use:   "status",
+	Short: "Print bumper counts per show",
+	RunE: func(cmd *cobra.Command, args []string) error {
+		return runStatus(configFromEnv(), os.Stdout)
+	},
+}
+
+func init() {
+	generateCmd.Flags().StringVar(&showFlag, "show", "", "show ID to generate bumpers for")
+	generateCmd.Flags().IntVar(&countFlag, "count", 1, "number of bumpers to generate")
+	generateAllCmd.Flags().IntVar(&minFlag, "min", 5, "minimum bumpers per show")
+
+	rootCmd.AddCommand(generateCmd, generateAllCmd, statusCmd)
+}
+
 func main() {
-	showFlag := flag.String("show", "", "show ID to generate bumpers for")
-	countFlag := flag.Int("count", 1, "number of bumpers to generate")
-	allFlag := flag.Bool("all", false, "generate bumpers for all shows")
-	minFlag := flag.Int("min", 5, "minimum bumpers per show (used with --all)")
-	statusFlag := flag.Bool("status", false, "print bumper counts per show and exit")
-	flag.Parse()
-
-	cfg := configFromEnv()
-
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
-	defer stop()
-
-	var err error
-	switch {
-	case *statusFlag:
-		err = runStatus(cfg, os.Stdout)
-	case *allFlag:
-		err = runGenerateAll(ctx, cfg, *minFlag)
-	case *showFlag != "":
-		err = runGenerate(ctx, cfg, *showFlag, *countFlag)
-	default:
-		fmt.Fprintln(os.Stderr, "usage: musicgen --show <id> [--count n] | --all [--min n] | --status")
-		os.Exit(1)
-	}
-
-	if err != nil {
+	if err := rootCmd.Execute(); err != nil {
 		log.Fatalf("musicgen: %v", err)
 	}
 }
