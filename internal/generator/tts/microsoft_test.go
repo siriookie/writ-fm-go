@@ -24,8 +24,11 @@ func TestMicrosoftSynthesize(t *testing.T) {
 		if err != nil {
 			t.Fatalf("ReadAll() error = %v", err)
 		}
-		if !strings.Contains(string(body), "en-US-GuyNeural") {
+		if !strings.Contains(string(body), "zh-CN-YunxiNeural") {
 			t.Fatalf("SSML missing mapped voice: %s", string(body))
+		}
+		if !strings.Contains(string(body), `xml:lang="zh-CN"`) {
+			t.Fatalf("SSML missing zh-CN xml:lang: %s", string(body))
 		}
 		if !strings.Contains(string(body), "hello &amp; goodbye") {
 			t.Fatalf("SSML missing escaped text: %s", string(body))
@@ -49,10 +52,18 @@ func TestMicrosoftSynthesize(t *testing.T) {
 func TestMapMicrosoftVoice(t *testing.T) {
 	t.Parallel()
 
-	if got := mapMicrosoftVoice("af_bella"); got != "en-US-AvaNeural" {
+	if got := mapMicrosoftVoice("af_bella"); got != "zh-CN-XiaoxiaoNeural" {
 		t.Fatalf("mapped voice = %q", got)
 	}
-	if got := mapMicrosoftVoice("en-US-AriaNeural"); got != "en-US-AriaNeural" {
+	if got := mapMicrosoftVoice("zh-CN-XiaoxiaoNeural"); got != "zh-CN-XiaoxiaoNeural" {
 		t.Fatalf("passthrough voice = %q", got)
+	}
+}
+
+func TestMicrosoftVoiceLang(t *testing.T) {
+	t.Parallel()
+
+	if got := microsoftVoiceLang("zh-CN-XiaoxiaoNeural"); got != "zh-CN" {
+		t.Fatalf("microsoftVoiceLang() = %q, want zh-CN", got)
 	}
 }

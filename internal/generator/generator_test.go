@@ -84,12 +84,12 @@ func TestGeneratorGenerate_WritesMetadataAndAudio(t *testing.T) {
 	t.Parallel()
 
 	fake := &fakeLLM{
-		responses: []string{strings.Repeat("word ", 1600)},
+		responses: []string{strings.Repeat("夜", 2200)},
 	}
 	renderer := &fakeRenderer{duration: 123.5}
 	talkDir := filepath.Join(t.TempDir(), "talk")
 	scriptsDir := filepath.Join(t.TempDir(), "scripts")
-	g := New(fake, renderer, talkDir, scriptsDir)
+	g := New(fake, renderer, "kokoro", talkDir, scriptsDir)
 	fakeNow := time.Date(2026, 4, 14, 22, 5, 6, 0, time.Local)
 	g.now = func() time.Time { return fakeNow }
 	g.idGen = func() string { return "fixedid" }
@@ -111,8 +111,8 @@ func TestGeneratorGenerate_WritesMetadataAndAudio(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Generate() error = %v", err)
 	}
-	if result.WordCount < 1500 {
-		t.Fatalf("WordCount = %d, want >= 1500", result.WordCount)
+	if result.WordCount < 2200 {
+		t.Fatalf("WordCount = %d, want >= 2200", result.WordCount)
 	}
 	if result.Duration != 123.5 {
 		t.Fatalf("Duration = %v, want 123.5", result.Duration)
@@ -153,7 +153,7 @@ func TestGeneratorGenerate_UsesMultiVoiceRenderer(t *testing.T) {
 		responses: []string{strings.Repeat("HOST: hello there traveler. GUEST: reply with memory and signal. ", 300)},
 	}
 	renderer := &fakeRenderer{duration: 88}
-	g := New(fake, renderer, t.TempDir(), t.TempDir())
+	g := New(fake, renderer, "microsoft", t.TempDir(), t.TempDir())
 	fakeNow := time.Date(2026, 4, 14, 22, 5, 6, 0, time.Local)
 	g.now = func() time.Time { return fakeNow }
 	g.idGen = func() string { return "multiid" }
@@ -177,11 +177,11 @@ func TestGeneratorGenerate_UsesMultiVoiceRenderer(t *testing.T) {
 	if len(renderer.multiCalls) != 1 {
 		t.Fatalf("multi render calls = %d, want 1", len(renderer.multiCalls))
 	}
-	if renderer.multiCalls[0].Voices["host"] != "bm_daniel" {
-		t.Fatalf("host voice = %q, want bm_daniel", renderer.multiCalls[0].Voices["host"])
+	if renderer.multiCalls[0].Voices["host"] != "zh_yunxi" {
+		t.Fatalf("host voice = %q, want zh_yunxi", renderer.multiCalls[0].Voices["host"])
 	}
-	if renderer.multiCalls[0].Voices["guest"] != "af_bella" {
-		t.Fatalf("guest voice = %q, want af_bella", renderer.multiCalls[0].Voices["guest"])
+	if renderer.multiCalls[0].Voices["guest"] != "zh_xiaoxiao" {
+		t.Fatalf("guest voice = %q, want zh_xiaoxiao", renderer.multiCalls[0].Voices["guest"])
 	}
 }
 
@@ -191,10 +191,10 @@ func TestGeneratorGenerate_RetriesShortScript(t *testing.T) {
 	fake := &fakeLLM{
 		responses: []string{
 			"too short",
-			strings.Repeat("word ", 1600),
+			strings.Repeat("夜", 2200),
 		},
 	}
-	g := New(fake, &fakeRenderer{duration: 10}, t.TempDir(), t.TempDir())
+	g := New(fake, &fakeRenderer{duration: 10}, "kokoro", t.TempDir(), t.TempDir())
 	fakeNow := time.Date(2026, 4, 14, 22, 5, 6, 0, time.Local)
 	g.now = func() time.Time { return fakeNow }
 	g.idGen = func() string { return "retryid" }
@@ -226,7 +226,7 @@ func TestGeneratorGenerate_FailsAfterShortRetries(t *testing.T) {
 	fake := &fakeLLM{
 		responses: []string{"short", "still short"},
 	}
-	g := New(fake, &fakeRenderer{duration: 10}, t.TempDir(), t.TempDir())
+	g := New(fake, &fakeRenderer{duration: 10}, "kokoro", t.TempDir(), t.TempDir())
 	fakeNow := time.Date(2026, 4, 14, 22, 5, 6, 0, time.Local)
 	g.now = func() time.Time { return fakeNow }
 	g.idGen = func() string { return "failid" }
@@ -263,7 +263,7 @@ func TestSlugify(t *testing.T) {
 func TestGeneratorAllocatePaths_UsesUniqueIDsForSameSecond(t *testing.T) {
 	t.Parallel()
 
-	g := New(&fakeLLM{}, &fakeRenderer{}, filepath.Join(t.TempDir(), "talk"), filepath.Join(t.TempDir(), "scripts"))
+	g := New(&fakeLLM{}, &fakeRenderer{}, "kokoro", filepath.Join(t.TempDir(), "talk"), filepath.Join(t.TempDir(), "scripts"))
 	fakeNow := time.Date(2026, 4, 14, 22, 5, 6, 0, time.Local)
 	g.now = func() time.Time { return fakeNow }
 

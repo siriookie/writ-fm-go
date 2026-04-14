@@ -79,6 +79,26 @@ func TestKokoroSynthesize_Timeout(t *testing.T) {
 	}
 }
 
+func TestDetectKokoroLangCode(t *testing.T) {
+	t.Parallel()
+
+	if got := detectKokoroLangCode("hello world"); got != "a" {
+		t.Fatalf("detectKokoroLangCode(english) = %q, want a", got)
+	}
+	if got := detectKokoroLangCode("你好，世界"); got != "z" {
+		t.Fatalf("detectKokoroLangCode(chinese) = %q, want z", got)
+	}
+}
+
+func TestKokoroInlineScript_UsesChineseLangCode(t *testing.T) {
+	t.Parallel()
+
+	script := kokoroInlineScript("你好世界", "af_bella", "out.wav")
+	if !strings.Contains(script, `lang_code="z"`) {
+		t.Fatalf("kokoroInlineScript() missing chinese lang_code: %s", script)
+	}
+}
+
 func newTestKokoro(t *testing.T) *KokoroTTS {
 	t.Helper()
 

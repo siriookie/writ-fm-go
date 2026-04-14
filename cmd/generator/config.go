@@ -24,6 +24,10 @@ type config struct {
 	LiteLLMModel    string
 	LiteLLMTags     []string
 	KokoroDir       string
+	KokoroModalURL  string
+	MimoAPIKey      string
+	MimoBaseURL     string
+	MimoTTSModel    string
 	AzureTTSKey     string
 	AzureTTSRegion  string
 	QwenTTSAPIKey   string
@@ -45,12 +49,16 @@ func configFromEnv() config {
 		ClaudeModel:     strings.TrimSpace(os.Getenv("CLAUDE_MODEL")),
 		OpenAIBaseURL:   getenvDefault("OPENAI_BASE_URL", "https://api.openai.com"),
 		OpenAIAPIKey:    strings.TrimSpace(os.Getenv("OPENAI_API_KEY")),
-		OpenAIModel:     getenvDefault("OPENAI_MODEL", "claude-3-5-haiku-20241022"),
+		OpenAIModel:     strings.TrimSpace(os.Getenv("OPENAI_MODEL")),
 		LiteLLMBaseURL:  getenvDefault("LITELLM_BASE_URL", "http://0.0.0.0:4000"),
 		LiteLLMAPIKey:   strings.TrimSpace(os.Getenv("LITELLM_API_KEY")),
 		LiteLLMModel:    getenvDefault("LITELLM_MODEL", "gpt-3.5-turbo"),
 		LiteLLMTags:     splitCSV(os.Getenv("LITELLM_TAGS")),
 		KokoroDir:       getenvDefault("KOKORO_DIR", defaultKokoroDir()),
+		KokoroModalURL:  strings.TrimSpace(os.Getenv("KOKORO_MODAL_URL")),
+		MimoAPIKey:      strings.TrimSpace(os.Getenv("MIMO_API_KEY")),
+		MimoBaseURL:     getenvDefault("MIMO_BASE_URL", "https://api.xiaomimimo.com/v1/chat/completions"),
+		MimoTTSModel:    getenvDefault("MIMO_TTS_MODEL", "mimo-v2-tts"),
 		AzureTTSKey:     strings.TrimSpace(os.Getenv("AZURE_TTS_KEY")),
 		AzureTTSRegion:  getenvDefault("AZURE_TTS_REGION", "eastus"),
 		QwenTTSAPIKey:   firstNonEmpty(strings.TrimSpace(os.Getenv("QWEN_TTS_API_KEY")), strings.TrimSpace(os.Getenv("DASHSCOPE_API_KEY"))),
@@ -72,7 +80,7 @@ func buildGenerator(cfg config) (generateService, error) {
 		return nil, err
 	}
 	renderer := gen.NewRenderer(ttsClient)
-	return gen.New(llmClient, renderer, cfg.TalkSegmentsDir, cfg.ScriptsDir), nil
+	return gen.New(llmClient, renderer, cfg.TTSBackend, cfg.TalkSegmentsDir, cfg.ScriptsDir), nil
 }
 
 func buildLLMClient(cfg config) (gen.LLMClient, error) {
@@ -102,6 +110,16 @@ func buildTTSClient(cfg config) (gentts.Client, error) {
 	switch strings.ToLower(strings.TrimSpace(cfg.TTSBackend)) {
 	case "kokoro":
 		return gentts.NewKokoroTTS(cfg.KokoroDir), nil
+	case "kokoro_modal":
+		if strings.TrimSpace(cfg.KokoroModalURL) == "" {
+			return nil, fmt.Errorf("KOKORO_MODAL_URL is required for TTS_BACKEND=%q", cfg.TTSBackend)
+		}
+		return gentts.NewKokoroModalTTS(cfg.KokoroModalURL), nil
+	case "mimo":
+		if strings.TrimSpace(cfg.MimoAPIKey) == "" {
+			return nil, fmt.Errorf("MIMO_API_KEY is required for TTS_BACKEND=%q", cfg.TTSBackend)
+		}
+		return gentts.NewMimoTTS(cfg.MimoAPIKey, cfg.MimoBaseURL, cfg.MimoTTSModel), nil
 	case "microsoft":
 		if strings.TrimSpace(cfg.AzureTTSKey) == "" {
 			return nil, fmt.Errorf("AZURE_TTS_KEY is required for TTS_BACKEND=%q", cfg.TTSBackend)

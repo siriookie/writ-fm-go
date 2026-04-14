@@ -132,7 +132,7 @@ from kokoro import KPipeline
 import numpy as np
 import soundfile as sf
 
-pipe = KPipeline(lang_code="a", repo_id="hexgrad/Kokoro-82M")
+pipe = KPipeline(lang_code=%q, repo_id="hexgrad/Kokoro-82M")
 generator = pipe(%q, voice=%q, speed=1.0)
 audio_segments = []
 for _, _, audio in generator:
@@ -145,5 +145,19 @@ else:
 
 sf.write(%q, full_audio, 24000)
 print("SUCCESS")
-`, text, voice, outputPath)
+`, detectKokoroLangCode(text), text, voice, outputPath)
+}
+
+func detectKokoroLangCode(text string) string {
+	for _, r := range text {
+		switch {
+		case r >= 0x4E00 && r <= 0x9FFF:
+			return "z"
+		case r >= 0x3400 && r <= 0x4DBF:
+			return "z"
+		case r >= 0x3000 && r <= 0x303F:
+			return "z"
+		}
+	}
+	return "a"
 }

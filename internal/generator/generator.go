@@ -81,6 +81,7 @@ type AudioRenderer interface {
 type Generator struct {
 	llm             LLMClient
 	renderer        AudioRenderer
+	ttsBackend      string
 	talkSegmentsDir string
 	scriptsDir      string
 	promptBuilder   *PromptBuilder
@@ -90,10 +91,11 @@ type Generator struct {
 }
 
 // New creates a generator core with explicit dependencies.
-func New(client LLMClient, renderer AudioRenderer, talkSegmentsDir, scriptsDir string) *Generator {
+func New(client LLMClient, renderer AudioRenderer, ttsBackend, talkSegmentsDir, scriptsDir string) *Generator {
 	return &Generator{
 		llm:             client,
 		renderer:        renderer,
+		ttsBackend:      strings.TrimSpace(ttsBackend),
 		talkSegmentsDir: talkSegmentsDir,
 		scriptsDir:      scriptsDir,
 		promptBuilder:   NewPromptBuilder(),
@@ -160,9 +162,9 @@ func (g *Generator) Generate(ctx context.Context, req GenerateRequest) (*Result,
 }
 
 func (g *Generator) generateScript(ctx context.Context, segmentType, prompt string) (string, int, error) {
-	target, ok := SegmentWordTargets[segmentType]
+	target, ok := SegmentLengthTargets[segmentType]
 	if !ok {
-		target = SegmentWordTargets["deep_dive"]
+		target = SegmentLengthTargets["deep_dive"]
 	}
 	minAcceptable := int(float64(target.Min) * 0.8)
 
@@ -173,9 +175,9 @@ func (g *Generator) generateScript(ctx context.Context, segmentType, prompt stri
 			lastErr = err
 			continue
 		}
-		wordCount := len(strings.Fields(script))
+		wordCount := countTextUnits(script)
 		if wordCount < minAcceptable {
-			lastErr = fmt.Errorf("%w: got %d words, need at least %d", ErrScriptTooShort, wordCount, minAcceptable)
+			lastErr = fmt.Errorf("%w: got %d text units, need at least %d", ErrScriptTooShort, wordCount, minAcceptable)
 			continue
 		}
 		return script, wordCount, nil
@@ -259,16 +261,27 @@ func (g *Generator) resolveVoices(req GenerateRequest) (map[string]string, error
 		voices = make(map[string]string, 2)
 	}
 	if strings.TrimSpace(voices["host"]) == "" {
-		hostVoice, err := persona.GetHostVoice(req.HostID)
+		hostVoice, err := persona.GetHostVoice(req.HostID, g.voiceBackend())
 		if err != nil {
 			return nil, err
 		}
 		voices["host"] = hostVoice
 	}
 	if isMultiVoiceSegment(req.SegmentType) && strings.TrimSpace(voices["guest"]) == "" {
-		voices["guest"] = "af_bella"
+		guestVoice, err := persona.GetHostVoice("ember", g.voiceBackend())
+		if err != nil {
+			return nil, err
+		}
+		voices["guest"] = guestVoice
 	}
 	return voices, nil
+}
+
+func (g *Generator) voiceBackend() string {
+	if strings.TrimSpace(g.ttsBackend) == "" {
+		return "kokoro"
+	}
+	return g.ttsBackend
 }
 
 func isMultiVoiceSegment(segmentType string) bool {

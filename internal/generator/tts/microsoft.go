@@ -16,11 +16,13 @@ const (
 )
 
 var defaultMicrosoftVoices = map[string]string{
-	"am_michael": "en-US-GuyNeural",
-	"bm_daniel":  "en-GB-RyanNeural",
-	"af_heart":   "en-US-JennyNeural",
-	"am_onyx":    "en-US-DavisNeural",
-	"af_bella":   "en-US-AvaNeural",
+	"am_michael":  "zh-CN-YunxiNeural",
+	"bm_daniel":   "zh-CN-YunxiNeural",
+	"af_heart":    "zh-CN-XiaoxiaoNeural",
+	"am_onyx":     "zh-CN-YunxiNeural",
+	"af_bella":    "zh-CN-XiaoxiaoNeural",
+	"zh_xiaoxiao": "zh-CN-XiaoxiaoNeural",
+	"zh_yunxi":    "zh-CN-YunxiNeural",
 }
 
 // MicrosoftTTS synthesizes speech via Azure Speech REST.
@@ -104,7 +106,7 @@ func mapMicrosoftVoice(voice string) string {
 	if strings.Contains(voice, "-") {
 		return voice
 	}
-	return defaultMicrosoftVoices["am_michael"]
+	return defaultMicrosoftVoices["zh_xiaoxiao"]
 }
 
 func buildMicrosoftSSML(text, voice string) string {
@@ -114,8 +116,18 @@ func buildMicrosoftSSML(text, voice string) string {
 		">", "&gt;",
 	)
 	return fmt.Sprintf(
-		`<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xml:lang="en-US"><voice name="%s">%s</voice></speak>`,
+		`<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xml:lang="%s"><voice name="%s">%s</voice></speak>`,
+		microsoftVoiceLang(voice),
 		voice,
 		replacer.Replace(text),
 	)
+}
+
+func microsoftVoiceLang(voice string) string {
+	voice = strings.TrimSpace(voice)
+	parts := strings.Split(voice, "-")
+	if len(parts) >= 2 {
+		return parts[0] + "-" + parts[1]
+	}
+	return "zh-CN"
 }
