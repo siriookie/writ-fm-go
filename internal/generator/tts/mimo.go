@@ -24,6 +24,34 @@ var validMimoVoices = map[string]struct{}{
 	"default_zh":   {},
 }
 
+var mimoVoiceAliases = map[string]string{
+	// Chinese / warm-female leaning aliases.
+	"af_bella":    "default_zh",
+	"af_heart":    "default_zh",
+	"zf_xiaoyi":   "default_zh",
+	"zf_xiaobei":  "default_zh",
+	"zh_xiaoxiao": "default_zh",
+	"jennifer":    "default_zh",
+	"cherry":      "default_zh",
+	"longtong":    "default_zh",
+	"longhua":     "default_zh",
+	"default_zh":  "default_zh",
+
+	// Chinese / lower-male leaning aliases.
+	"am_michael":   "mimo_default",
+	"am_onyx":      "mimo_default",
+	"bm_daniel":    "mimo_default",
+	"zm_yunjian":   "mimo_default",
+	"zh_yunxi":     "mimo_default",
+	"elias":        "mimo_default",
+	"ryan":         "mimo_default",
+	"longjielidou": "mimo_default",
+	"mimo_default": "mimo_default",
+
+	// English fallback aliases.
+	"default_en": "default_en",
+}
+
 // MimoTTS synthesizes speech through Xiaomi Mimo's OpenAI-compatible API.
 type MimoTTS struct {
 	apiKey     string
@@ -102,7 +130,7 @@ func (m *MimoTTS) Synthesize(ctx context.Context, text, voice string, dst io.Wri
 		},
 		Audio: mimoAudio{
 			Format: "wav",
-			Voice:  mapMimoVoice(voice),
+			Voice:  mapMimoVoice(text, voice),
 		},
 	})
 	if err != nil {
@@ -157,13 +185,34 @@ func (m *MimoTTS) Synthesize(ctx context.Context, text, voice string, dst io.Wri
 	return nil
 }
 
-func mapMimoVoice(voice string) string {
+func mapMimoVoice(text, voice string) string {
 	voice = strings.TrimSpace(voice)
 	if _, ok := validMimoVoices[voice]; ok {
 		return voice
+	}
+	if mapped, ok := mimoVoiceAliases[strings.ToLower(voice)]; ok {
+		return mapped
+	}
+
+	if containsHan(text) {
+		return "default_zh"
 	}
 	if strings.Contains(strings.ToLower(voice), "zh") {
 		return "default_zh"
 	}
 	return "default_en"
+}
+
+func containsHan(text string) bool {
+	for _, r := range text {
+		switch {
+		case r >= 0x4E00 && r <= 0x9FFF:
+			return true
+		case r >= 0x3400 && r <= 0x4DBF:
+			return true
+		case r >= 0x3000 && r <= 0x303F:
+			return true
+		}
+	}
+	return false
 }
