@@ -23,12 +23,14 @@ import (
 )
 
 var (
-	showFlag  string
-	typeFlag  string
-	topicFlag string
-	countFlag int
-	minFlag   int
-	focusFlag string
+	showFlag            string
+	typeFlag            string
+	topicFlag           string
+	countFlag           int
+	minFlag             int
+	focusFlag           string
+	performanceModeFlag string
+	debugScriptFlag     bool
 )
 
 var (
@@ -99,9 +101,13 @@ func init() {
 	generateCmd.Flags().StringVar(&typeFlag, "type", "", "specific segment type to generate")
 	generateCmd.Flags().StringVar(&topicFlag, "topic", "", "specific topic to use")
 	generateCmd.Flags().IntVar(&countFlag, "count", 1, "number of segments to generate")
+	generateCmd.Flags().StringVar(&performanceModeFlag, "performance-mode", "constrained", "performance cue mode: constrained or expressive")
+	generateCmd.Flags().BoolVar(&debugScriptFlag, "debug-script", false, "log the raw generated script before TTS rendering")
 
 	generateAllCmd.Flags().IntVar(&minFlag, "min", 3, "minimum number of talk segments per show")
 	generateAllCmd.Flags().StringVar(&typeFlag, "type", "", "specific segment type to generate for all shows")
+	generateAllCmd.Flags().StringVar(&performanceModeFlag, "performance-mode", "constrained", "performance cue mode: constrained or expressive")
+	generateAllCmd.Flags().BoolVar(&debugScriptFlag, "debug-script", false, "log the raw generated script before TTS rendering")
 
 	listTopicsCmd.Flags().StringVar(&focusFlag, "focus", "", "topic focus to list")
 
@@ -142,7 +148,10 @@ func runGenerate(ctx context.Context, cfg config, showID, segmentType, topic str
 		if err != nil {
 			return fmt.Errorf("segment %d: %w", i+1, err)
 		}
-		log.Printf("generator: wrote %s (%.1fs, %d 字)", filepath.Base(result.AudioPath), result.Duration, result.WordCount)
+		if shouldDebugScript(cfg) {
+			log.Printf("generator: raw script for %s/%s:\n%s", show.ShowID, req.SegmentType, result.Script)
+		}
+		log.Printf("generator: wrote %s (%.1fs, %d chars)", filepath.Base(result.AudioPath), result.Duration, result.WordCount)
 	}
 	return nil
 }
@@ -180,7 +189,10 @@ func runGenerateAll(ctx context.Context, cfg config, min int, segmentType string
 				log.Printf("generator: %s segment %d/%d failed: %v", show.ShowID, i+1, need, err)
 				continue
 			}
-			log.Printf("generator: %s wrote %s (%.1fs, %d 字)", show.ShowID, filepath.Base(result.AudioPath), result.Duration, result.WordCount)
+			if shouldDebugScript(cfg) {
+				log.Printf("generator: raw script for %s/%s:\n%s", show.ShowID, req.SegmentType, result.Script)
+			}
+			log.Printf("generator: %s wrote %s (%.1fs, %d chars)", show.ShowID, filepath.Base(result.AudioPath), result.Duration, result.WordCount)
 		}
 	}
 	return nil
@@ -303,6 +315,7 @@ func buildGenerateRequest(show *schedulerShow, segmentType, topic string) (gen.G
 		SegmentType:     segmentType,
 		Topic:           topic,
 		Voices:          cloneVoices(show.Voices),
+		PerformanceMode: gen.NormalizePerformanceMode(gen.PerformanceMode(performanceModeFlag)),
 	}, nil
 }
 
@@ -348,4 +361,8 @@ func cloneVoices(src map[string]string) map[string]string {
 		dst[k] = v
 	}
 	return dst
+}
+
+func shouldDebugScript(cfg config) bool {
+	return debugScriptFlag || cfg.DebugScript
 }

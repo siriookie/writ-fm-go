@@ -145,10 +145,29 @@ else:
 
 sf.write(%q, full_audio, 24000)
 print("SUCCESS")
-`, detectKokoroLangCode(text), text, voice, outputPath)
+`, kokoroLangCode(text, voice), text, voice, outputPath)
 }
 
-func detectKokoroLangCode(text string) string {
+func kokoroLangCode(text, voice string) string {
+	if code := kokoroLangCodeFromVoice(voice); code != "" {
+		return code
+	}
+	return detectKokoroLangCodeFromText(text)
+}
+
+func kokoroLangCodeFromVoice(voice string) string {
+	voice = strings.ToLower(strings.TrimSpace(voice))
+	switch {
+	case strings.HasPrefix(voice, "z"):
+		return "z"
+	case strings.HasPrefix(voice, "a"), strings.HasPrefix(voice, "b"):
+		return "a"
+	default:
+		return ""
+	}
+}
+
+func detectKokoroLangCodeFromText(text string) string {
 	for _, r := range text {
 		switch {
 		case r >= 0x4E00 && r <= 0x9FFF:

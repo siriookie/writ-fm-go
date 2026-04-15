@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	perf "github.com/writ-fm/go/internal/generator/performance"
 	gentts "github.com/writ-fm/go/internal/generator/tts"
 )
 
@@ -21,10 +22,9 @@ const (
 )
 
 var (
-	sentenceExtractRE = regexp.MustCompile(`[^.!?]+[.!?]?`)
-	speakerSplitRE    = regexp.MustCompile(`((?:HOST_A|HOST_B|GUEST|HOST|主持人甲|主持人乙|主持甲|主持乙|嘉宾|主持人|[A-Z][A-Z\s.]+)(?:：|:))`)
-	speakerTagRE      = regexp.MustCompile(`^(?:HOST_A|HOST_B|GUEST|HOST|主持人甲|主持人乙|主持甲|主持乙|嘉宾|主持人|[A-Z][A-Z\s.]+)(?:：|:)$`)
-	textUnitRE        = regexp.MustCompile(`[\p{Han}\p{Hiragana}\p{Katakana}\p{Hangul}]|[\p{L}\p{N}]+(?:['_-][\p{L}\p{N}]+)*`)
+	speakerSplitRE = regexp.MustCompile(`((?:HOST_A|HOST_B|GUEST|HOST|主持人甲|主持人乙|主持人|嘉宾|主持人 [A-Z][A-Z\s.]+)(?:：|:))`)
+	speakerTagRE   = regexp.MustCompile(`^(?:HOST_A|HOST_B|GUEST|HOST|主持人甲|主持人乙|主持人|嘉宾|主持人 [A-Z][A-Z\s.]+)(?:：|:)$`)
+	textUnitRE     = regexp.MustCompile(`[\p{Han}\p{Hiragana}\p{Katakana}\p{Hangul}]|[\p{L}\p{N}]+(?:['_-][\p{L}\p{N}]+)*`)
 )
 
 // DialoguePart is one speaker-labelled portion of a multi-voice script.
@@ -36,33 +36,56 @@ type DialoguePart struct {
 // Renderer turns generated scripts into audio files through a TTS backend.
 type Renderer struct {
 	tts            gentts.Client
+	backend        string
+	debugChunkDir  string
 	ffmpegBin      string
 	ffprobeBin     string
 	tempDir        string
 	commandContext func(context.Context, string, ...string) *exec.Cmd
 }
 
+type RendererOption func(*Renderer)
+
+func WithBackend(name string) RendererOption {
+	return func(r *Renderer) {
+		r.backend = strings.ToLower(strings.TrimSpace(name))
+	}
+}
+
+func WithChunkDebug(dir string) RendererOption {
+	return func(r *Renderer) {
+		r.debugChunkDir = strings.TrimSpace(dir)
+	}
+}
+
 // NewRenderer returns a renderer with production defaults.
-func NewRenderer(client gentts.Client) *Renderer {
-	return &Renderer{
+func NewRenderer(client gentts.Client, opts ...RendererOption) *Renderer {
+	renderer := &Renderer{
 		tts:            client,
+		backend:        "generic",
 		ffmpegBin:      "ffmpeg",
 		ffprobeBin:     "ffprobe",
 		commandContext: exec.CommandContext,
 	}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(renderer)
+		}
+	}
+	return renderer
 }
 
-// PreprocessForTTS normalizes generator markup into spoken text.
-//
-// Markup tags are shared between English and Chinese scripts; the replacement
-// values use punctuation that TTS engines on both languages interpret as
-// natural pauses or vocal colour rather than literal words.
+// PreprocessForTTS only performs final cleanup before sending text to a TTS backend.
 func PreprocessForTTS(text string) string {
 	replacer := strings.NewReplacer(
+		"**", "",
+		"__", "",
+		"`", "",
 		"[pause]", "……",
-		"[chuckle]", "呵……",
-		"[cough]", "咳……",
-		`"`, "",
+		"[breath]", "（轻轻吸气）",
+		"[laugh]", "（轻笑）",
+		"[chuckle]", "（轻笑）",
+		"[cough]", "（轻咳）",
 	)
 	return strings.TrimSpace(replacer.Replace(text))
 }
@@ -154,25 +177,15 @@ func ParseDialogue(script string) []DialoguePart {
 }
 
 // RenderSingle renders a single-voice script to outputPath.
-func (r *Renderer) RenderSingle(ctx context.Context, script, voice, outputPath string) error {
-	script = PreprocessForTTS(script)
-	chunks := SplitIntoChunks(script, defaultChunkWords)
-	if len(chunks) == 0 {
-		return fmt.Errorf("generator/renderer: no text to render")
-	}
-
-	chunkFiles, err := r.renderChunks(ctx, chunks, voice, outputPath, "chunk")
-	if err != nil {
-		return err
-	}
-	return r.concatenateAudio(ctx, chunkFiles, outputPath, 0)
+func (r *Renderer) RenderSingle(ctx context.Context, script, voice, outputPath string, mode PerformanceMode) error {
+	return r.renderPreparedSingle(ctx, r.prepareScript(script, mode), voice, outputPath)
 }
 
 // RenderMulti renders a multi-voice script to outputPath.
-func (r *Renderer) RenderMulti(ctx context.Context, script string, voices map[string]string, outputPath string) error {
+func (r *Renderer) RenderMulti(ctx context.Context, script string, voices map[string]string, outputPath string, mode PerformanceMode) error {
 	parts := ParseDialogue(script)
 	if len(parts) == 0 {
-		return r.RenderSingle(ctx, script, voices["host"], outputPath)
+		return r.RenderSingle(ctx, script, voices["host"], outputPath, mode)
 	}
 
 	hostVoice := firstNonEmpty(voices["host"], "am_michael")
@@ -180,14 +193,14 @@ func (r *Renderer) RenderMulti(ctx context.Context, script string, voices map[st
 
 	rendered := make([]string, 0, len(parts))
 	for i, part := range parts {
-		text := PreprocessForTTS(part.Text)
+		text := r.prepareScript(part.Text, mode)
 		if text == "" {
 			continue
 		}
 		voice := speakerVoice(part.Speaker, hostVoice, guestVoice)
 		partPath := withStemSuffix(outputPath, fmt.Sprintf("_part%03d", i))
 		if countTextUnits(text) > defaultChunkWords {
-			if err := r.RenderSingle(ctx, text, voice, partPath); err != nil {
+			if err := r.renderPreparedSingle(ctx, text, voice, partPath); err != nil {
 				return err
 			}
 		} else if err := r.synthesizeToFile(ctx, text, voice, partPath); err != nil {
@@ -226,11 +239,34 @@ func (r *Renderer) Duration(ctx context.Context, path string) (float64, error) {
 	return seconds, nil
 }
 
+func (r *Renderer) prepareScript(script string, mode PerformanceMode) string {
+	normalized := perf.NormalizePerformanceCues(script, perf.Mode(NormalizePerformanceMode(mode)), r.backend)
+	rendered := perf.RenderPerformanceForBackend(normalized, r.backend)
+	return PreprocessForTTS(rendered)
+}
+
+func (r *Renderer) renderPreparedSingle(ctx context.Context, script, voice, outputPath string) error {
+	chunks := SplitIntoChunks(script, defaultChunkWords)
+	if len(chunks) == 0 {
+		return fmt.Errorf("generator/renderer: no text to render")
+	}
+
+	chunkFiles, err := r.renderChunks(ctx, chunks, voice, outputPath, "chunk")
+	if err != nil {
+		return err
+	}
+	return r.concatenateAudio(ctx, chunkFiles, outputPath, 0)
+}
+
 func (r *Renderer) renderChunks(ctx context.Context, chunks []string, voice, outputPath, label string) ([]string, error) {
 	files := make([]string, 0, len(chunks))
 	for i, chunk := range chunks {
 		chunkPath := withStemSuffix(outputPath, fmt.Sprintf("_%s%03d", label, i))
 		if err := r.synthesizeToFile(ctx, chunk, voice, chunkPath); err != nil {
+			r.cleanupFiles(files)
+			return nil, err
+		}
+		if err := r.debugDumpChunk(outputPath, label, i, voice, chunk, chunkPath); err != nil {
 			r.cleanupFiles(files)
 			return nil, err
 		}
@@ -242,6 +278,10 @@ func (r *Renderer) renderChunks(ctx context.Context, chunks []string, voice, out
 func (r *Renderer) synthesizeToFile(ctx context.Context, text, voice, path string) error {
 	if r.tts == nil {
 		return fmt.Errorf("generator/renderer: TTS client is required")
+	}
+	text = gentts.CleanText(text)
+	if text == "" {
+		return gentts.ErrEmptyText
 	}
 	for attempt := 0; attempt < 2; attempt++ {
 		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
@@ -308,7 +348,19 @@ func (r *Renderer) concatenateAudio(ctx context.Context, chunkFiles []string, ou
 	if commandContext == nil {
 		commandContext = exec.CommandContext
 	}
-	cmd := commandContext(ctx, r.ffmpegBin, "-y", "-f", "concat", "-safe", "0", "-i", listFile, "-c", "copy", outputPath)
+	cmd := commandContext(
+		ctx,
+		r.ffmpegBin,
+		"-y",
+		"-f", "concat",
+		"-safe", "0",
+		"-i", listFile,
+		"-vn",
+		"-ac", "1",
+		"-ar", "24000",
+		"-c:a", "pcm_s16le",
+		outputPath,
+	)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
@@ -367,11 +419,48 @@ func (r *Renderer) cleanupFiles(paths []string) {
 	}
 }
 
+func (r *Renderer) debugDumpChunk(outputPath, label string, index int, voice, text, audioPath string) error {
+	if strings.TrimSpace(r.debugChunkDir) == "" {
+		return nil
+	}
+
+	stem := strings.TrimSuffix(filepath.Base(outputPath), filepath.Ext(outputPath))
+	dir := filepath.Join(r.debugChunkDir, stem)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("generator/renderer: create chunk debug dir: %w", err)
+	}
+
+	base := fmt.Sprintf("%s_%03d", label, index)
+	metaPath := filepath.Join(dir, base+".txt")
+	audioDebugPath := filepath.Join(dir, base+filepath.Ext(audioPath))
+
+	var builder strings.Builder
+	builder.WriteString("voice=")
+	builder.WriteString(voice)
+	builder.WriteString("\n")
+	builder.WriteString("text=\n")
+	builder.WriteString(text)
+	builder.WriteString("\n")
+
+	if err := os.WriteFile(metaPath, []byte(builder.String()), 0o644); err != nil {
+		return fmt.Errorf("generator/renderer: write chunk debug text: %w", err)
+	}
+
+	audio, err := os.ReadFile(audioPath)
+	if err != nil {
+		return fmt.Errorf("generator/renderer: read chunk debug audio: %w", err)
+	}
+	if err := os.WriteFile(audioDebugPath, audio, 0o644); err != nil {
+		return fmt.Errorf("generator/renderer: write chunk debug audio: %w", err)
+	}
+	return nil
+}
+
 func speakerVoice(speaker, hostVoice, guestVoice string) string {
 	switch speaker {
-	case "HOST", "HOST_A", "主持人", "主持人甲", "主持甲":
+	case "HOST", "HOST_A", "主持人", "主持人甲":
 		return hostVoice
-	case "GUEST", "HOST_B", "嘉宾", "主持人乙", "主持乙":
+	case "GUEST", "HOST_B", "嘉宾", "主持人乙":
 		return guestVoice
 	default:
 		return hostVoice
@@ -453,6 +542,9 @@ func normalizeSpeakerTag(tag string) string {
 	tag = strings.TrimSpace(tag)
 	tag = strings.TrimSuffix(tag, ":")
 	tag = strings.TrimSuffix(tag, "：")
+	if speakerTagRE.MatchString(tag + ":") {
+		return strings.TrimSuffix(tag, ":")
+	}
 	return tag
 }
 

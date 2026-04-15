@@ -110,16 +110,20 @@ func mapMicrosoftVoice(voice string) string {
 }
 
 func buildMicrosoftSSML(text, voice string) string {
-	replacer := strings.NewReplacer(
-		"&", "&amp;",
-		"<", "&lt;",
-		">", "&gt;",
-	)
+	body := text
+	if !containsMicrosoftSSML(text) {
+		replacer := strings.NewReplacer(
+			"&", "&amp;",
+			"<", "&lt;",
+			">", "&gt;",
+		)
+		body = replacer.Replace(text)
+	}
 	return fmt.Sprintf(
-		`<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xml:lang="%s"><voice name="%s">%s</voice></speak>`,
+		`<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xmlns:mstts="https://www.w3.org/2001/mstts" xml:lang="%s"><voice name="%s">%s</voice></speak>`,
 		microsoftVoiceLang(voice),
 		voice,
-		replacer.Replace(text),
+		body,
 	)
 }
 
@@ -130,4 +134,11 @@ func microsoftVoiceLang(voice string) string {
 		return parts[0] + "-" + parts[1]
 	}
 	return "zh-CN"
+}
+
+func containsMicrosoftSSML(text string) bool {
+	return strings.Contains(text, "<break") ||
+		strings.Contains(text, "<prosody") ||
+		strings.Contains(text, "<mstts:express-as") ||
+		strings.Contains(text, "</mstts:express-as>")
 }

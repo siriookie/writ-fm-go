@@ -40,7 +40,7 @@ func TestKokoroSynthesize(t *testing.T) {
 	}
 }
 
-func TestKokoroSynthesize_EmptyText(t *testing.T) {
+func TestKokoroSynthesizeEmptyText(t *testing.T) {
 	t.Parallel()
 
 	client := &KokoroTTS{}
@@ -51,7 +51,7 @@ func TestKokoroSynthesize_EmptyText(t *testing.T) {
 	}
 }
 
-func TestKokoroSynthesize_ReportsCommandFailure(t *testing.T) {
+func TestKokoroSynthesizeReportsCommandFailure(t *testing.T) {
 	t.Setenv("GO_WANT_KOKORO_HELPER", "1")
 	t.Setenv("GO_HELPER_KOKORO_STDERR", "boom")
 	t.Setenv("GO_HELPER_KOKORO_EXIT_CODE", "4")
@@ -65,7 +65,7 @@ func TestKokoroSynthesize_ReportsCommandFailure(t *testing.T) {
 	}
 }
 
-func TestKokoroSynthesize_Timeout(t *testing.T) {
+func TestKokoroSynthesizeTimeout(t *testing.T) {
 	t.Setenv("GO_WANT_KOKORO_HELPER", "1")
 	t.Setenv("GO_HELPER_KOKORO_SLEEP_MS", "200")
 
@@ -79,21 +79,32 @@ func TestKokoroSynthesize_Timeout(t *testing.T) {
 	}
 }
 
-func TestDetectKokoroLangCode(t *testing.T) {
+func TestDetectKokoroLangCodeFromText(t *testing.T) {
 	t.Parallel()
 
-	if got := detectKokoroLangCode("hello world"); got != "a" {
-		t.Fatalf("detectKokoroLangCode(english) = %q, want a", got)
+	if got := detectKokoroLangCodeFromText("hello world"); got != "a" {
+		t.Fatalf("detectKokoroLangCodeFromText(english) = %q, want a", got)
 	}
-	if got := detectKokoroLangCode("你好，世界"); got != "z" {
-		t.Fatalf("detectKokoroLangCode(chinese) = %q, want z", got)
+	if got := detectKokoroLangCodeFromText("你好，世界"); got != "z" {
+		t.Fatalf("detectKokoroLangCodeFromText(chinese) = %q, want z", got)
 	}
 }
 
-func TestKokoroInlineScript_UsesChineseLangCode(t *testing.T) {
+func TestKokoroLangCodePrefersVoiceFamily(t *testing.T) {
 	t.Parallel()
 
-	script := kokoroInlineScript("你好世界", "af_bella", "out.wav")
+	if got := kokoroLangCode("J. Cole", "zf_xiaoyi"); got != "z" {
+		t.Fatalf("kokoroLangCode(chinese voice) = %q, want z", got)
+	}
+	if got := kokoroLangCode("你好世界", "af_bella"); got != "a" {
+		t.Fatalf("kokoroLangCode(english voice) = %q, want a", got)
+	}
+}
+
+func TestKokoroInlineScriptUsesChineseLangCode(t *testing.T) {
+	t.Parallel()
+
+	script := kokoroInlineScript("J. Cole", "zf_xiaoyi", "out.wav")
 	if !strings.Contains(script, `lang_code="z"`) {
 		t.Fatalf("kokoroInlineScript() missing chinese lang_code: %s", script)
 	}

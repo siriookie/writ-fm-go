@@ -6,15 +6,21 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	gen "github.com/writ-fm/go/internal/generator"
 	genllm "github.com/writ-fm/go/internal/generator/llm"
 	gentts "github.com/writ-fm/go/internal/generator/tts"
+	"github.com/writ-fm/go/internal/news"
 )
 
 type config struct {
 	LLMBackend      string
 	TTSBackend      string
+	PerformanceMode string
+	DebugScript     bool
+	DebugChunks     bool
+	DebugChunkDir   string
 	ClaudeModel     string
 	OpenAIBaseURL   string
 	OpenAIAPIKey    string
@@ -33,6 +39,10 @@ type config struct {
 	QwenTTSAPIKey   string
 	QwenTTSModel    string
 	CosyVoiceAPIKey string
+	NewsFeeds       []string
+	NewsMaxItems    int
+	NewsCacheTTL    time.Duration
+	NewsTimeout     time.Duration
 	SchedulePath    string
 	TalkSegmentsDir string
 	ScriptsDir      string
@@ -46,6 +56,10 @@ func configFromEnv() config {
 	return config{
 		LLMBackend:      getenvDefault("LLM_BACKEND", "claude_cli"),
 		TTSBackend:      getenvDefault("TTS_BACKEND", "kokoro"),
+		PerformanceMode: getenvDefault("PERFORMANCE_MODE", "constrained"),
+		DebugScript:     getenvBool("GENERATOR_DEBUG_SCRIPT", false),
+		DebugChunks:     getenvBool("GENERATOR_DEBUG_CHUNKS", false),
+		DebugChunkDir:   getenvDefault("GENERATOR_DEBUG_CHUNK_DIR", filepath.Join("output", "debug_chunks")),
 		ClaudeModel:     strings.TrimSpace(os.Getenv("CLAUDE_MODEL")),
 		OpenAIBaseURL:   getenvDefault("OPENAI_BASE_URL", "https://api.openai.com"),
 		OpenAIAPIKey:    strings.TrimSpace(os.Getenv("OPENAI_API_KEY")),
@@ -64,6 +78,10 @@ func configFromEnv() config {
 		QwenTTSAPIKey:   firstNonEmpty(strings.TrimSpace(os.Getenv("QWEN_TTS_API_KEY")), strings.TrimSpace(os.Getenv("DASHSCOPE_API_KEY"))),
 		QwenTTSModel:    getenvDefault("QWEN_TTS_MODEL", "qwen3-tts-flash-realtime"),
 		CosyVoiceAPIKey: firstNonEmpty(strings.TrimSpace(os.Getenv("COSYVOICE_API_KEY")), strings.TrimSpace(os.Getenv("DASHSCOPE_API_KEY"))),
+		NewsFeeds:       splitCSV(os.Getenv("NEWS_FEEDS")),
+		NewsMaxItems:    getenvInt("NEWS_MAX_ITEMS", 8),
+		NewsCacheTTL:    getenvDurationSeconds("NEWS_CACHE_TTL", 600),
+		NewsTimeout:     getenvDurationSeconds("NEWS_TIMEOUT", 6),
 		SchedulePath:    getenvDefault("SCHEDULE_PATH", "config/schedule.yaml"),
 		TalkSegmentsDir: getenvDefault("TALK_SEGMENTS_DIR", "output/talk_segments"),
 		ScriptsDir:      getenvDefault("SCRIPTS_DIR", "output/scripts"),
@@ -79,8 +97,18 @@ func buildGenerator(cfg config) (generateService, error) {
 	if err != nil {
 		return nil, err
 	}
-	renderer := gen.NewRenderer(ttsClient)
-	return gen.New(llmClient, renderer, cfg.TTSBackend, cfg.TalkSegmentsDir, cfg.ScriptsDir), nil
+	rendererOpts := []gen.RendererOption{gen.WithBackend(cfg.TTSBackend)}
+	if cfg.DebugChunks {
+		rendererOpts = append(rendererOpts, gen.WithChunkDebug(cfg.DebugChunkDir))
+	}
+	renderer := gen.NewRenderer(ttsClient, rendererOpts...)
+	newsClient := news.NewClient(
+		news.WithFeeds(cfg.NewsFeeds),
+		news.WithMaxItems(cfg.NewsMaxItems),
+		news.WithCacheTTL(cfg.NewsCacheTTL),
+		news.WithTimeout(cfg.NewsTimeout),
+	)
+	return gen.New(llmClient, renderer, cfg.TTSBackend, cfg.TalkSegmentsDir, cfg.ScriptsDir, gen.WithHeadlineProvider(newsClient)), nil
 }
 
 func buildLLMClient(cfg config) (gen.LLMClient, error) {
@@ -145,6 +173,34 @@ func getenvDefault(key, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+func getenvBool(key string, fallback bool) bool {
+	value := strings.TrimSpace(strings.ToLower(os.Getenv(key)))
+	switch value {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return fallback
+	}
+}
+
+func getenvInt(key string, fallback int) int {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return fallback
+	}
+	var parsed int
+	if _, err := fmt.Sscanf(value, "%d", &parsed); err != nil || parsed <= 0 {
+		return fallback
+	}
+	return parsed
+}
+
+func getenvDurationSeconds(key string, fallbackSeconds int) time.Duration {
+	return time.Duration(getenvInt(key, fallbackSeconds)) * time.Second
 }
 
 func splitCSV(raw string) []string {

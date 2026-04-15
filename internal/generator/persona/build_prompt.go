@@ -40,22 +40,23 @@ type OperatorContext struct {
 }
 
 type hostPromptData struct {
-	HostName        string
-	StationName     string
-	Identity        string
-	VoiceStyle      string
-	Philosophy      string
-	AntiPatterns    string
-	HasShowContext  bool
-	ShowName        string
-	ShowDescription string
-	TopicFocus      string
-	SegmentType     string
-	Date            string
-	CurrentTime     string
-	PeriodLabel     string
-	Mood            string
-	OperatorState   string
+	HostName         string
+	StationName      string
+	Identity         string
+	VoiceStyle       string
+	Philosophy       string
+	AntiPatterns     string
+	PerformanceNotes string
+	HasShowContext   bool
+	ShowName         string
+	ShowDescription  string
+	TopicFocus       string
+	SegmentType      string
+	Date             string
+	CurrentTime      string
+	PeriodLabel      string
+	Mood             string
+	OperatorState    string
 }
 
 // TimePeriodMoods mirrors the Python persona time-aware behavior.
@@ -130,18 +131,19 @@ func (b *Builder) BuildHostPrompt(personaID string, showCtx *ShowContext) (strin
 	now := b.now()
 	opCtx := operatorContextAt(now, -1)
 	data := hostPromptData{
-		HostName:       host.Name,
-		StationName:    StationName,
-		Identity:       host.Identity,
-		VoiceStyle:     host.VoiceStyle,
-		Philosophy:     host.Philosophy,
-		AntiPatterns:   host.AntiPatterns,
-		HasShowContext: showCtx != nil,
-		Date:           formatChineseDate(now),
-		CurrentTime:    opCtx.CurrentTime,
-		PeriodLabel:    localizePeriod(opCtx.Period),
-		Mood:           opCtx.Mood,
-		OperatorState:  opCtx.OperatorState,
+		HostName:         host.Name,
+		StationName:      StationName,
+		Identity:         host.Identity,
+		VoiceStyle:       host.VoiceStyle,
+		Philosophy:       host.Philosophy,
+		AntiPatterns:     host.AntiPatterns,
+		PerformanceNotes: host.PerformanceNotes,
+		HasShowContext:   showCtx != nil,
+		Date:             formatChineseDate(now),
+		CurrentTime:      opCtx.CurrentTime,
+		PeriodLabel:      localizePeriod(opCtx.Period),
+		Mood:             opCtx.Mood,
+		OperatorState:    opCtx.OperatorState,
 	}
 	if showCtx != nil {
 		data.ShowName = defaultString(showCtx.ShowName, StationName)

@@ -15,6 +15,7 @@ import (
 
 	"github.com/writ-fm/go/internal/generator/llm"
 	"github.com/writ-fm/go/internal/generator/persona"
+	"github.com/writ-fm/go/internal/news"
 )
 
 var (
@@ -36,6 +37,7 @@ type GenerateRequest struct {
 	GuestName       string
 	GuestContext    string
 	Voices          map[string]string
+	PerformanceMode PerformanceMode
 }
 
 // ScriptMetadata is the JSON sidecar persisted for generated scripts.
@@ -72,9 +74,14 @@ type LLMClient interface {
 
 // AudioRenderer is the subset of renderer behavior used by generator orchestration.
 type AudioRenderer interface {
-	RenderSingle(ctx context.Context, script, voice, outputPath string) error
-	RenderMulti(ctx context.Context, script string, voices map[string]string, outputPath string) error
+	RenderSingle(ctx context.Context, script, voice, outputPath string, mode PerformanceMode) error
+	RenderMulti(ctx context.Context, script string, voices map[string]string, outputPath string, mode PerformanceMode) error
 	Duration(ctx context.Context, path string) (float64, error)
+}
+
+// HeadlineProvider fetches current news headlines for prompt injection.
+type HeadlineProvider interface {
+	FetchHeadlines(ctx context.Context) ([]news.Headline, error)
 }
 
 // Generator orchestrates prompt building, LLM calls, quality gates, rendering, and metadata persistence.
@@ -88,11 +95,22 @@ type Generator struct {
 	topicPicker     func(string) string
 	idGen           func() string
 	now             func() time.Time
+	headlines       HeadlineProvider
+}
+
+// Option customizes Generator construction.
+type Option func(*Generator)
+
+// WithHeadlineProvider injects the optional news provider used by news_analysis.
+func WithHeadlineProvider(provider HeadlineProvider) Option {
+	return func(g *Generator) {
+		g.headlines = provider
+	}
 }
 
 // New creates a generator core with explicit dependencies.
-func New(client LLMClient, renderer AudioRenderer, ttsBackend, talkSegmentsDir, scriptsDir string) *Generator {
-	return &Generator{
+func New(client LLMClient, renderer AudioRenderer, ttsBackend, talkSegmentsDir, scriptsDir string, opts ...Option) *Generator {
+	g := &Generator{
 		llm:             client,
 		renderer:        renderer,
 		ttsBackend:      strings.TrimSpace(ttsBackend),
@@ -103,6 +121,10 @@ func New(client LLMClient, renderer AudioRenderer, ttsBackend, talkSegmentsDir, 
 		idGen:           defaultID,
 		now:             time.Now,
 	}
+	for _, opt := range opts {
+		opt(g)
+	}
+	return g
 }
 
 // Generate creates a script, renders audio, and persists metadata.
@@ -110,8 +132,11 @@ func (g *Generator) Generate(ctx context.Context, req GenerateRequest) (*Result,
 	if req.Topic == "" {
 		req.Topic = g.topicPicker(req.TopicFocus)
 	}
+	if err := g.injectHeadlines(ctx, &req); err != nil {
+		return nil, err
+	}
 
-	prompt, err := g.promptBuilder.Build(BuildRequest{
+	promptReq := BuildRequest{
 		HostID:          req.HostID,
 		SegmentType:     req.SegmentType,
 		Topic:           req.Topic,
@@ -121,12 +146,10 @@ func (g *Generator) Generate(ctx context.Context, req GenerateRequest) (*Result,
 		Headlines:       req.Headlines,
 		GuestName:       req.GuestName,
 		GuestContext:    req.GuestContext,
-	})
-	if err != nil {
-		return nil, err
+		PerformanceMode: req.PerformanceMode,
 	}
 
-	script, wordCount, err := g.generateScript(ctx, req.SegmentType, prompt)
+	prompt, script, wordCount, err := g.generateScript(ctx, req.SegmentType, promptReq)
 	if err != nil {
 		return nil, err
 	}
@@ -141,7 +164,7 @@ func (g *Generator) Generate(ctx context.Context, req GenerateRequest) (*Result,
 		return nil, err
 	}
 
-	duration, err := g.renderAudio(ctx, req.SegmentType, script, voices, audioPath)
+	duration, err := g.renderAudio(ctx, req.SegmentType, script, voices, audioPath, req.PerformanceMode)
 	if err != nil {
 		return nil, err
 	}
@@ -161,31 +184,59 @@ func (g *Generator) Generate(ctx context.Context, req GenerateRequest) (*Result,
 	}, nil
 }
 
-func (g *Generator) generateScript(ctx context.Context, segmentType, prompt string) (string, int, error) {
+func (g *Generator) injectHeadlines(ctx context.Context, req *GenerateRequest) error {
+	if req == nil || req.SegmentType != "news_analysis" || strings.TrimSpace(req.Headlines) != "" || g.headlines == nil {
+		return nil
+	}
+
+	headlines, err := g.headlines.FetchHeadlines(ctx)
+	if err != nil {
+		return nil
+	}
+	req.Headlines = news.FormatHeadlines(headlines, 8)
+	return nil
+}
+
+func (g *Generator) generateScript(ctx context.Context, segmentType string, buildReq BuildRequest) (string, string, int, error) {
 	target, ok := SegmentLengthTargets[segmentType]
 	if !ok {
 		target = SegmentLengthTargets["deep_dive"]
 	}
-	minAcceptable := int(float64(target.Min) * 0.8)
+	gate := newQualityGate(target)
 
 	var lastErr error
-	for range 2 {
+	lastPrompt := ""
+	lastUnits := 0
+
+	for attempt := 0; attempt < gate.maxAttempts; attempt++ {
+		if attempt > 0 {
+			buildReq.RetryInstruction = gate.retryInstruction(attempt-1, lastUnits)
+		}
+
+		prompt, err := g.promptBuilder.Build(buildReq)
+		if err != nil {
+			return "", "", 0, err
+		}
+		lastPrompt = prompt
+
 		script, err := g.llm.Generate(ctx, prompt)
 		if err != nil {
 			lastErr = err
 			continue
 		}
 		wordCount := countTextUnits(script)
-		if wordCount < minAcceptable {
-			lastErr = fmt.Errorf("%w: got %d text units, need at least %d", ErrScriptTooShort, wordCount, minAcceptable)
+		lastUnits = wordCount
+		if !gate.accepted(wordCount, attempt) {
+			lastErr = fmt.Errorf("%w: got %d text units, need at least %d", ErrScriptTooShort, wordCount, gate.minimumForAttempt(attempt))
 			continue
 		}
-		return script, wordCount, nil
+		return lastPrompt, script, wordCount, nil
 	}
+
 	if lastErr == nil {
 		lastErr = llm.ErrEmptyResponse
 	}
-	return "", 0, lastErr
+	return lastPrompt, "", 0, lastErr
 }
 
 func (g *Generator) allocatePaths(req GenerateRequest) (string, string, error) {
@@ -234,16 +285,16 @@ func (g *Generator) writeMetadata(req GenerateRequest, script string, wordCount 
 	return nil
 }
 
-func (g *Generator) renderAudio(ctx context.Context, segmentType, script string, voices map[string]string, audioPath string) (float64, error) {
+func (g *Generator) renderAudio(ctx context.Context, segmentType, script string, voices map[string]string, audioPath string, mode PerformanceMode) (float64, error) {
 	if g.renderer == nil {
 		return 0, fmt.Errorf("generator: renderer is required")
 	}
 
 	var err error
 	if isMultiVoiceSegment(segmentType) {
-		err = g.renderer.RenderMulti(ctx, script, voices, audioPath)
+		err = g.renderer.RenderMulti(ctx, script, voices, audioPath, NormalizePerformanceMode(mode))
 	} else {
-		err = g.renderer.RenderSingle(ctx, script, voices["host"], audioPath)
+		err = g.renderer.RenderSingle(ctx, script, voices["host"], audioPath, NormalizePerformanceMode(mode))
 	}
 	if err != nil {
 		return 0, err

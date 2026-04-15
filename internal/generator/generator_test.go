@@ -11,17 +11,19 @@ import (
 	"time"
 
 	"github.com/writ-fm/go/internal/generator/persona"
+	"github.com/writ-fm/go/internal/news"
 )
 
 type fakeLLM struct {
 	responses []string
 	errs      []error
 	calls     int
+	prompts   []string
 }
 
 func (f *fakeLLM) Generate(ctx context.Context, prompt string) (string, error) {
 	_ = ctx
-	_ = prompt
+	f.prompts = append(f.prompts, prompt)
 	idx := f.calls
 	f.calls++
 	if idx < len(f.errs) && f.errs[idx] != nil {
@@ -41,33 +43,52 @@ type fakeRenderer struct {
 	renderErr   error
 }
 
+type fakeHeadlineProvider struct {
+	items []news.Headline
+	err   error
+	calls int
+}
+
+func (f *fakeHeadlineProvider) FetchHeadlines(ctx context.Context) ([]news.Headline, error) {
+	_ = ctx
+	f.calls++
+	if f.err != nil {
+		return nil, f.err
+	}
+	dst := make([]news.Headline, len(f.items))
+	copy(dst, f.items)
+	return dst, nil
+}
+
 type renderSingleCall struct {
 	Script string
 	Voice  string
 	Path   string
+	Mode   PerformanceMode
 }
 
 type renderMultiCall struct {
 	Script string
 	Voices map[string]string
 	Path   string
+	Mode   PerformanceMode
 }
 
-func (f *fakeRenderer) RenderSingle(ctx context.Context, script, voice, outputPath string) error {
+func (f *fakeRenderer) RenderSingle(ctx context.Context, script, voice, outputPath string, mode PerformanceMode) error {
 	_ = ctx
 	if f.renderErr != nil {
 		return f.renderErr
 	}
-	f.singleCalls = append(f.singleCalls, renderSingleCall{Script: script, Voice: voice, Path: outputPath})
+	f.singleCalls = append(f.singleCalls, renderSingleCall{Script: script, Voice: voice, Path: outputPath, Mode: mode})
 	return os.WriteFile(outputPath, []byte(script), 0o644)
 }
 
-func (f *fakeRenderer) RenderMulti(ctx context.Context, script string, voices map[string]string, outputPath string) error {
+func (f *fakeRenderer) RenderMulti(ctx context.Context, script string, voices map[string]string, outputPath string, mode PerformanceMode) error {
 	_ = ctx
 	if f.renderErr != nil {
 		return f.renderErr
 	}
-	f.multiCalls = append(f.multiCalls, renderMultiCall{Script: script, Voices: cloneStringMap(voices), Path: outputPath})
+	f.multiCalls = append(f.multiCalls, renderMultiCall{Script: script, Voices: cloneStringMap(voices), Path: outputPath, Mode: mode})
 	return os.WriteFile(outputPath, []byte(script), 0o644)
 }
 
@@ -80,7 +101,7 @@ func (f *fakeRenderer) Duration(ctx context.Context, path string) (float64, erro
 	return f.duration, nil
 }
 
-func TestGeneratorGenerate_WritesMetadataAndAudio(t *testing.T) {
+func TestGeneratorGenerateWritesMetadataAndAudio(t *testing.T) {
 	t.Parallel()
 
 	fake := &fakeLLM{
@@ -120,6 +141,9 @@ func TestGeneratorGenerate_WritesMetadataAndAudio(t *testing.T) {
 	if len(renderer.singleCalls) != 1 {
 		t.Fatalf("single render calls = %d, want 1", len(renderer.singleCalls))
 	}
+	if renderer.singleCalls[0].Mode != PerformanceModeConstrained {
+		t.Fatalf("mode = %q, want constrained", renderer.singleCalls[0].Mode)
+	}
 
 	data, err := os.ReadFile(result.MetadataPath)
 	if err != nil {
@@ -146,7 +170,7 @@ func TestGeneratorGenerate_WritesMetadataAndAudio(t *testing.T) {
 	}
 }
 
-func TestGeneratorGenerate_UsesMultiVoiceRenderer(t *testing.T) {
+func TestGeneratorGenerateUsesMultiVoiceRenderer(t *testing.T) {
 	t.Parallel()
 
 	fake := &fakeLLM{
@@ -170,6 +194,7 @@ func TestGeneratorGenerate_UsesMultiVoiceRenderer(t *testing.T) {
 		TopicFocus:      "music_history",
 		SegmentType:     "interview",
 		Topic:           "Pirate radio and memory",
+		PerformanceMode: PerformanceModeExpressive,
 	})
 	if err != nil {
 		t.Fatalf("Generate() error = %v", err)
@@ -183,9 +208,12 @@ func TestGeneratorGenerate_UsesMultiVoiceRenderer(t *testing.T) {
 	if renderer.multiCalls[0].Voices["guest"] != "zh_xiaoxiao" {
 		t.Fatalf("guest voice = %q, want zh_xiaoxiao", renderer.multiCalls[0].Voices["guest"])
 	}
+	if renderer.multiCalls[0].Mode != PerformanceModeExpressive {
+		t.Fatalf("mode = %q, want expressive", renderer.multiCalls[0].Mode)
+	}
 }
 
-func TestGeneratorGenerate_RetriesShortScript(t *testing.T) {
+func TestGeneratorGenerateRetriesShortScript(t *testing.T) {
 	t.Parallel()
 
 	fake := &fakeLLM{
@@ -218,14 +246,15 @@ func TestGeneratorGenerate_RetriesShortScript(t *testing.T) {
 	if fake.calls != 2 {
 		t.Fatalf("calls = %d, want 2", fake.calls)
 	}
+	if len(fake.prompts) < 2 || !strings.Contains(fake.prompts[1], "修订要求：") {
+		t.Fatalf("retry prompt missing revision instructions:\n%s", strings.Join(fake.prompts, "\n---\n"))
+	}
 }
 
-func TestGeneratorGenerate_FailsAfterShortRetries(t *testing.T) {
+func TestGeneratorGenerateFailsAfterShortRetries(t *testing.T) {
 	t.Parallel()
 
-	fake := &fakeLLM{
-		responses: []string{"short", "still short"},
-	}
+	fake := &fakeLLM{responses: []string{"short", "still short", "tiny"}}
 	g := New(fake, &fakeRenderer{duration: 10}, "kokoro", t.TempDir(), t.TempDir())
 	fakeNow := time.Date(2026, 4, 14, 22, 5, 6, 0, time.Local)
 	g.now = func() time.Time { return fakeNow }
@@ -247,6 +276,90 @@ func TestGeneratorGenerate_FailsAfterShortRetries(t *testing.T) {
 	if !errors.Is(err, ErrScriptTooShort) {
 		t.Fatalf("Generate() error = %v, want ErrScriptTooShort", err)
 	}
+	if fake.calls != 3 {
+		t.Fatalf("calls = %d, want 3", fake.calls)
+	}
+}
+
+func TestGeneratorGenerateAcceptsRelaxedThresholdOnThirdAttempt(t *testing.T) {
+	t.Parallel()
+
+	fake := &fakeLLM{
+		responses: []string{
+			strings.Repeat("夜", 1000),
+			strings.Repeat("夜", 1200),
+			strings.Repeat("夜", 1450),
+		},
+	}
+	renderer := &fakeRenderer{duration: 10}
+	g := New(fake, renderer, "kokoro", t.TempDir(), t.TempDir())
+	fakeNow := time.Date(2026, 4, 14, 22, 5, 6, 0, time.Local)
+	g.now = func() time.Time { return fakeNow }
+	g.idGen = func() string { return "relaxedid" }
+	g.promptBuilder = NewPromptBuilderWithDeps(
+		persona.NewBuilderWithClock(func() time.Time { return fakeNow }).BuildHostPrompt,
+		func(n int) int { return 0 },
+	)
+
+	result, err := g.Generate(context.Background(), GenerateRequest{
+		ShowID:          "midnight_signal",
+		ShowName:        "Midnight Signal",
+		ShowDescription: "Late night transmissions.",
+		HostID:          "liminal_operator",
+		TopicFocus:      "philosophy",
+		SegmentType:     "deep_dive",
+		Topic:           "The archaeology of memory",
+	})
+	if err != nil {
+		t.Fatalf("Generate() error = %v", err)
+	}
+	if fake.calls != 3 {
+		t.Fatalf("calls = %d, want 3", fake.calls)
+	}
+	if result.WordCount != 1450 {
+		t.Fatalf("WordCount = %d, want 1450", result.WordCount)
+	}
+}
+
+func TestGeneratorGenerateInjectsNewsHeadlines(t *testing.T) {
+	t.Parallel()
+
+	fake := &fakeLLM{
+		responses: []string{strings.Repeat("晨", 2200)},
+	}
+	headlines := &fakeHeadlineProvider{
+		items: []news.Headline{
+			{Title: "第一条标题", Source: "BBC 中文"},
+			{Title: "第二条标题", Source: "NPR"},
+		},
+	}
+	g := New(fake, &fakeRenderer{duration: 10}, "kokoro", t.TempDir(), t.TempDir(), WithHeadlineProvider(headlines))
+	fakeNow := time.Date(2026, 4, 14, 22, 5, 6, 0, time.Local)
+	g.now = func() time.Time { return fakeNow }
+	g.idGen = func() string { return "newsid" }
+	g.promptBuilder = NewPromptBuilderWithDeps(
+		persona.NewBuilderWithClock(func() time.Time { return fakeNow }).BuildHostPrompt,
+		func(n int) int { return 0 },
+	)
+
+	_, err := g.Generate(context.Background(), GenerateRequest{
+		ShowID:          "signal_report",
+		ShowName:        "Signal Report",
+		ShowDescription: "News through a late-night lens.",
+		HostID:          "signal",
+		TopicFocus:      "current_events",
+		SegmentType:     "news_analysis",
+		Topic:           "本周新闻",
+	})
+	if err != nil {
+		t.Fatalf("Generate() error = %v", err)
+	}
+	if headlines.calls != 1 {
+		t.Fatalf("headline calls = %d, want 1", headlines.calls)
+	}
+	if len(fake.prompts) != 1 || !strings.Contains(fake.prompts[0], "- [BBC 中文] 第一条标题") {
+		t.Fatalf("prompt missing injected headlines:\n%s", strings.Join(fake.prompts, "\n---\n"))
+	}
 }
 
 func TestSlugify(t *testing.T) {
@@ -260,7 +373,7 @@ func TestSlugify(t *testing.T) {
 	}
 }
 
-func TestGeneratorAllocatePaths_UsesUniqueIDsForSameSecond(t *testing.T) {
+func TestGeneratorAllocatePathsUsesUniqueIDsForSameSecond(t *testing.T) {
 	t.Parallel()
 
 	g := New(&fakeLLM{}, &fakeRenderer{}, "kokoro", filepath.Join(t.TempDir(), "talk"), filepath.Join(t.TempDir(), "scripts"))
