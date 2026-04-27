@@ -1,0 +1,57 @@
+  {{.BasePrompt}}
+
+  ━━ 本段写作任务 ━━
+  节目：{{.ShowName}}
+  段落：第 {{.SegmentOrdinal}} / {{.TotalSegments}} 段（{{if eq .SegmentOrdinal 1}}首段，可自然开场{{else}}续段，直接承接前文{{end}}）
+  目标字数：约 {{.TargetLength}} 字
+
+  当前段落要求（以此为最高优先级）：
+  {{.SegmentJSON}}
+
+  ━━ 表演控制 ━━
+  {{.PerformanceInstructions}}
+
+  ━━ 输出规则 ━━
+  - 只输出最终进入 TTS 的口播正文，无 Markdown、无标题、无 JSON。
+  - 必须使用中文口播正文。即使 source materials 是英文，也要消化后改写成自然中文讲述；不要输出英文段落或英文 transcript。
+  - 不写"本段将会""下面是""好的"等说明性文字。
+  - 不在正文里说"第一段""这一段"。
+  {{.SpeakerContract}}
+
+  ━━ 段落边界 ━━
+  {{if .PreviousTranscript}}
+  此前已播 transcript 如下，当前段必须承接其事实、语气和未完成铺垫：
+  <transcript_so_far>
+  {{.PreviousTranscript}}
+  </transcript_so_far>
+  {{else}}
+  这是首段。可自然与听众寒暄后直接进入本期内容，不要写等待互动句。
+  {{end}}
+  {{if .IsFinal}}
+  这是最后一段，让内容自然收束，不要再开启新议题。
+  {{else}}
+  这不是最后一段。段尾停在一个具体细节、画面、动作、时间点、地点、人物状态或信息点上。不要总结本段，不要解释它的重要性，不要提示下段内容，不要写“接下来/下一步/后面会看到/这一点很关键”这类节目引导句。
+  {{end}}
+
+  ━━ 参考材料（仅取与本段 goal 相关部分） ━━
+  完整节目 outline（仅供上下文参考，勿平均复述）：
+  {{.OutlineJSON}}
+
+  {{if .SourceMaterials}}
+  本期 source materials（只用与当前段落 goal / key_points 相关的内容）：
+  <source_materials>
+  {{.SourceMaterials}}
+  </source_materials>
+  {{end}}
+
+  {{if .NewsMaterials}}
+  新闻原文（只用与当前段落 key_points 相关的事实，不要平均覆盖）：
+  <source_materials>
+  {{.NewsMaterials}}
+  </source_materials>
+  {{end}}
+
+  {{if .RetryInstruction}}
+  ━━ 修订要求 ━━
+  {{.RetryInstruction}}
+  {{end}}

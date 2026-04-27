@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -16,7 +17,7 @@ func TestClientFetchHeadlinesParsesRSSAndAtomAndDedupes(t *testing.T) {
 	rss := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, `<?xml version="1.0" encoding="UTF-8"?>
 <rss><channel><title>BBC 中文</title>
-<item><title>同一条新闻</title></item>
+<item><title>同一条新闻</title><description><![CDATA[<p>第一条新闻的正文摘要。</p>]]></description><link>https://example.com/one</link><pubDate>Mon, 27 Apr 2026 10:00:00 GMT</pubDate></item>
 <item><title>另一条新闻</title></item>
 </channel></rss>`)
 	}))
@@ -47,6 +48,15 @@ func TestClientFetchHeadlinesParsesRSSAndAtomAndDedupes(t *testing.T) {
 	}
 	if headlines[0].Source != "BBC 中文" {
 		t.Fatalf("headlines[0].Source = %q, want BBC 中文", headlines[0].Source)
+	}
+	if headlines[0].Summary != "第一条新闻的正文摘要。" {
+		t.Fatalf("headlines[0].Summary = %q", headlines[0].Summary)
+	}
+	if headlines[0].Link != "https://example.com/one" {
+		t.Fatalf("headlines[0].Link = %q", headlines[0].Link)
+	}
+	if headlines[0].Published == "" {
+		t.Fatalf("headlines[0].Published is empty")
 	}
 	if headlines[2].Source != "NPR" {
 		t.Fatalf("headlines[2].Source = %q, want NPR", headlines[2].Source)
@@ -130,5 +140,39 @@ func TestClientFetchHeadlinesFallsBackWhenOneFeedFails(t *testing.T) {
 	}
 	if len(headlines) != 1 || headlines[0].Title != "可用标题" {
 		t.Fatalf("unexpected headlines = %#v", headlines)
+	}
+}
+
+func TestClientFetchArticleExtractsLinkedPageParagraphs(t *testing.T) {
+	t.Parallel()
+
+	var serverURL string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/feed":
+			fmt.Fprintf(w, `<?xml version="1.0"?><rss><channel><title>Feed</title><item><title>Selected story</title><description>RSS short summary.</description><link>%s/article</link></item></channel></rss>`, serverURL)
+		case "/article":
+			fmt.Fprint(w, `<html><head><script>ignore()</script></head><body><article><p>First real article paragraph with enough detail to keep.</p><p>Second paragraph names agencies, timeline, and consequences.</p></article></body></html>`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	serverURL = server.URL
+	t.Cleanup(server.Close)
+
+	client := NewClient(
+		WithFeeds([]string{server.URL + "/feed"}),
+		WithHTTPClient(server.Client()),
+	)
+	headlines, err := client.FetchHeadlines(context.Background())
+	if err != nil {
+		t.Fatalf("FetchHeadlines() error = %v", err)
+	}
+	enriched, err := client.FetchArticle(context.Background(), headlines[0])
+	if err != nil {
+		t.Fatalf("FetchArticle() error = %v", err)
+	}
+	if !strings.Contains(enriched.Content, "First real article paragraph") || !strings.Contains(enriched.Content, "Second paragraph names agencies") {
+		t.Fatalf("enriched content = %q", enriched.Content)
 	}
 }

@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -25,10 +26,21 @@ var defaultFeeds = []string{
 	"https://feeds.bbci.co.uk/zhongwen/simp/rss.xml",
 }
 
-// Headline is one normalized feed item.
+var htmlTagRE = regexp.MustCompile(`<[^>]+>`)
+var (
+	scriptStyleRE = regexp.MustCompile(`(?is)<(script|style|noscript)[^>]*>.*?</(script|style|noscript)>`)
+	paragraphRE   = regexp.MustCompile(`(?is)<p\b[^>]*>(.*?)</p>`)
+)
+
+// Headline is one normalized feed item with enough context for analysis.
 type Headline struct {
-	Title  string
-	Source string
+	Title     string
+	Source    string
+	Summary   string
+	Content   string
+	Comments  string
+	Link      string
+	Published string
 }
 
 // Client fetches, caches, and normalizes RSS/Atom headlines.
@@ -169,11 +181,12 @@ func (c *Client) fetchFresh(ctx context.Context) ([]Headline, error) {
 	results := make(chan fetchResult, len(c.feeds))
 	var wg sync.WaitGroup
 
-	for _, feedURL := range c.feeds {
+	for i, feedURL := range c.feeds {
+		i := i
 		feedURL := feedURL
 		wg.Go(func() {
 			items, err := c.fetchFeed(ctx, feedURL)
-			results <- fetchResult{items: items, err: err}
+			results <- fetchResult{index: i, items: items, err: err}
 		})
 	}
 
@@ -183,8 +196,13 @@ func (c *Client) fetchFresh(ctx context.Context) ([]Headline, error) {
 	seen := make(map[string]struct{}, c.maxItems)
 	headlines := make([]Headline, 0, c.maxItems)
 	var failures []error
+	ordered := make([]fetchResult, len(c.feeds))
 
 	for result := range results {
+		ordered[result.index] = result
+	}
+
+	for _, result := range ordered {
 		if result.err != nil {
 			failures = append(failures, result.err)
 			continue
@@ -220,6 +238,7 @@ func (c *Client) fetchFresh(ctx context.Context) ([]Headline, error) {
 }
 
 type fetchResult struct {
+	index int
 	items []Headline
 	err   error
 }
@@ -255,6 +274,63 @@ func (c *Client) fetchFeed(ctx context.Context, feedURL string) ([]Headline, err
 	return items, nil
 }
 
+// FetchArticle enriches one headline by fetching its linked article page and extracting body paragraphs.
+func (c *Client) FetchArticle(ctx context.Context, item Headline) (Headline, error) {
+	link := strings.TrimSpace(item.Link)
+	if link == "" {
+		return item, nil
+	}
+	reqCtx, cancel := context.WithTimeout(ctx, c.timeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, link, nil)
+	if err != nil {
+		return item, fmt.Errorf("news: build article request for %s: %w", link, err)
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return item, fmt.Errorf("news: fetch article %s: %w", link, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return item, fmt.Errorf("news: fetch article %s: status %d", link, resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 3<<20))
+	if err != nil {
+		return item, fmt.Errorf("news: read article %s: %w", link, err)
+	}
+	if content := extractArticleText(body); content != "" {
+		item.Content = content
+	}
+	return item, nil
+}
+
+func extractArticleText(data []byte) string {
+	html := scriptStyleRE.ReplaceAllString(string(data), " ")
+	matches := paragraphRE.FindAllStringSubmatch(html, -1)
+	seen := make(map[string]struct{}, len(matches))
+	paragraphs := make([]string, 0, len(matches))
+	for _, match := range matches {
+		if len(match) < 2 {
+			continue
+		}
+		text := cleanFeedText(match[1])
+		if len([]rune(text)) < 20 {
+			continue
+		}
+		key := normalizeTitle(text)
+		if key == "" {
+			continue
+		}
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		paragraphs = append(paragraphs, text)
+	}
+	return strings.Join(paragraphs, "\n")
+}
+
 func parseHeadlines(data []byte, fallback string) ([]Headline, error) {
 	decoder := xml.NewDecoder(bytes.NewReader(data))
 
@@ -262,6 +338,11 @@ func parseHeadlines(data []byte, fallback string) ([]Headline, error) {
 		stack          []string
 		sourceTitle    strings.Builder
 		entryTitle     strings.Builder
+		entrySummary   strings.Builder
+		entryContent   strings.Builder
+		entryComments  strings.Builder
+		entryLink      string
+		entryPublished strings.Builder
 		inEntry        bool
 		headlines      []Headline
 		resolvedSource string
@@ -283,6 +364,19 @@ func parseHeadlines(data []byte, fallback string) ([]Headline, error) {
 			if name == "item" || name == "entry" {
 				inEntry = true
 				entryTitle.Reset()
+				entrySummary.Reset()
+				entryContent.Reset()
+				entryComments.Reset()
+				entryLink = ""
+				entryPublished.Reset()
+			}
+			if inEntry && name == "link" {
+				for _, attr := range token.Attr {
+					if attr.Name.Local == "href" && strings.TrimSpace(attr.Value) != "" {
+						entryLink = strings.TrimSpace(attr.Value)
+						break
+					}
+				}
 			}
 		case xml.EndElement:
 			name := token.Name.Local
@@ -297,8 +391,13 @@ func parseHeadlines(data []byte, fallback string) ([]Headline, error) {
 						source = fallback
 					}
 					headlines = append(headlines, Headline{
-						Title:  title,
-						Source: source,
+						Title:     title,
+						Source:    source,
+						Summary:   cleanFeedText(entrySummary.String()),
+						Content:   cleanFeedText(entryContent.String()),
+						Comments:  cleanFeedText(entryComments.String()),
+						Link:      strings.TrimSpace(entryLink),
+						Published: strings.TrimSpace(entryPublished.String()),
 					})
 				}
 				inEntry = false
@@ -313,15 +412,26 @@ func parseHeadlines(data []byte, fallback string) ([]Headline, error) {
 			}
 		case xml.CharData:
 			text := strings.TrimSpace(string(token))
-			if text == "" || len(stack) < 2 || stack[len(stack)-1] != "title" {
+			if text == "" || len(stack) < 2 {
 				continue
 			}
 			parent := stack[len(stack)-2]
+			current := stack[len(stack)-1]
 			switch {
-			case inEntry && (parent == "item" || parent == "entry"):
+			case inEntry && current == "title" && (parent == "item" || parent == "entry"):
 				entryTitle.WriteString(text)
-			case !inEntry && (parent == "channel" || parent == "feed"):
+			case !inEntry && current == "title" && (parent == "channel" || parent == "feed"):
 				sourceTitle.WriteString(text)
+			case inEntry && (current == "description" || current == "summary" || current == "subtitle"):
+				appendWithSpace(&entrySummary, text)
+			case inEntry && (current == "encoded" || current == "content"):
+				appendWithSpace(&entryContent, text)
+			case inEntry && (current == "comments" || current == "comment"):
+				appendWithSpace(&entryComments, text)
+			case inEntry && current == "link" && entryLink == "":
+				entryLink = text
+			case inEntry && (current == "pubDate" || current == "published" || current == "updated"):
+				appendWithSpace(&entryPublished, text)
 			}
 		}
 	}
@@ -330,6 +440,30 @@ func parseHeadlines(data []byte, fallback string) ([]Headline, error) {
 		return nil, fmt.Errorf("no headlines found")
 	}
 	return headlines, nil
+}
+
+func appendWithSpace(builder *strings.Builder, text string) {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return
+	}
+	if builder.Len() > 0 {
+		builder.WriteByte(' ')
+	}
+	builder.WriteString(text)
+}
+
+func cleanFeedText(text string) string {
+	text = htmlTagRE.ReplaceAllString(text, " ")
+	text = strings.NewReplacer(
+		"&nbsp;", " ",
+		"&amp;", "&",
+		"&lt;", "<",
+		"&gt;", ">",
+		"&quot;", `"`,
+		"&#39;", "'",
+	).Replace(text)
+	return strings.TrimSpace(strings.Join(strings.Fields(text), " "))
 }
 
 func normalizeTitle(title string) string {

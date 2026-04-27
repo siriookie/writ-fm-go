@@ -3,8 +3,10 @@ package generator
 import (
 	"bytes"
 	"embed"
+	"encoding/json"
 	"fmt"
 	"math/rand"
+	"strings"
 	"text/template"
 
 	"github.com/writ-fm/go/internal/generator/persona"
@@ -31,7 +33,7 @@ var SegmentLengthTargets = map[string]ScriptLengthTarget{
 	"news_analysis":    {Min: 1800, Max: 3000},
 	"interview":        {Min: 2600, Max: 4200},
 	"panel":            {Min: 2600, Max: 4200},
-	"story":            {Min: 1800, Max: 3200},
+	"story":            {Min: 6000, Max: 7600},
 	"listener_mailbag": {Min: 1800, Max: 2800},
 	"music_essay":      {Min: 2200, Max: 3600},
 	"station_id":       {Min: 20, Max: 40},
@@ -46,12 +48,50 @@ type promptEnvelopeData struct {
 	BasePrompt              string
 	SegmentType             string
 	Topic                   string
+	SourceMaterials         string
 	TargetMin               int
 	TargetMax               int
 	LengthInstructions      string
 	OutputInstructions      string
 	TaskPrompt              string
 	PerformanceInstructions string
+}
+
+type outlinePromptData struct {
+	BasePrompt      string
+	ShowName        string
+	ShowDescription string
+	SegmentType     string
+	Topic           string
+	TopicFocus      string
+	SourceMaterials string
+	Headlines       string
+	GuestName       string
+	GuestContext    string
+	TargetMin       int
+	TargetMax       int
+	MinSegments     int
+	MaxSegments     int
+	Speakers        string
+}
+
+type segmentScriptPromptData struct {
+	BasePrompt              string
+	ShowName                string
+	SegmentType             string
+	Topic                   string
+	SegmentOrdinal          int
+	TotalSegments           int
+	TargetLength            int
+	PerformanceInstructions string
+	OutlineJSON             string
+	SegmentJSON             string
+	SourceMaterials         string
+	NewsMaterials           string
+	PreviousTranscript      string
+	IsFinal                 bool
+	SpeakerContract         string
+	RetryInstruction        string
 }
 
 type taskPromptData struct {
@@ -64,10 +104,12 @@ type BuildRequest struct {
 	HostID           string
 	SegmentType      string
 	Topic            string
+	SourceMaterials  string
 	ShowName         string
 	ShowDescription  string
 	TopicFocus       string
 	Headlines        string
+	NewsMaterials    string
 	GuestName        string
 	GuestContext     string
 	PerformanceMode  PerformanceMode
@@ -138,6 +180,7 @@ func (b *PromptBuilder) Build(req BuildRequest) (string, error) {
 		BasePrompt:              base,
 		SegmentType:             req.SegmentType,
 		Topic:                   topic,
+		SourceMaterials:         strings.TrimSpace(req.SourceMaterials),
 		TargetMin:               target.Min,
 		TargetMax:               target.Max,
 		LengthInstructions:      lengthPromptInstructions(req.SegmentType, target),
@@ -156,12 +199,113 @@ func (b *PromptBuilder) Build(req BuildRequest) (string, error) {
 	return buf.String(), nil
 }
 
+// BuildOutlinePrompt asks the LLM for a strict JSON plan before script writing.
+func (b *PromptBuilder) BuildOutlinePrompt(req BuildRequest) (string, error) {
+	req.PerformanceMode = NormalizePerformanceMode(req.PerformanceMode)
+
+	showCtx := &persona.ShowContext{
+		ShowName:        req.ShowName,
+		ShowDescription: req.ShowDescription,
+		TopicFocus:      req.TopicFocus,
+		SegmentType:     req.SegmentType,
+	}
+	base, err := b.buildHostPrompt(req.HostID, showCtx)
+	if err != nil {
+		return "", err
+	}
+	target, ok := SegmentLengthTargets[req.SegmentType]
+	if !ok {
+		target = SegmentLengthTargets["deep_dive"]
+	}
+	minSegments, maxSegments := outlineSegmentCountRange(req.SegmentType)
+	speakers := "HOST"
+	if req.SegmentType == "interview" {
+		speakers = "HOST and GUEST, or HOST_A and HOST_B"
+	} else if req.SegmentType == "panel" {
+		speakers = "HOST_A, HOST_B, and GUEST"
+	}
+
+	var buf bytes.Buffer
+	if err := promptTemplates.ExecuteTemplate(&buf, "outline_prompt.tmpl", outlinePromptData{
+		BasePrompt:      base,
+		ShowName:        req.ShowName,
+		ShowDescription: req.ShowDescription,
+		SegmentType:     req.SegmentType,
+		Topic:           req.Topic,
+		TopicFocus:      req.TopicFocus,
+		SourceMaterials: strings.TrimSpace(req.SourceMaterials),
+		Headlines:       req.Headlines,
+		GuestName:       req.GuestName,
+		GuestContext:    req.GuestContext,
+		TargetMin:       target.Min,
+		TargetMax:       target.Max,
+		MinSegments:     minSegments,
+		MaxSegments:     maxSegments,
+		Speakers:        speakers,
+	}); err != nil {
+		return "", fmt.Errorf("generator: render outline prompt: %w", err)
+	}
+	return buf.String(), nil
+}
+
+// BuildSegmentScriptPrompt asks the LLM to write one final spoken segment from an outline.
+func (b *PromptBuilder) BuildSegmentScriptPrompt(req BuildRequest, outline *Outline, segment OutlineSegment, previousTranscript string, isFinal bool) (string, error) {
+	req.PerformanceMode = NormalizePerformanceMode(req.PerformanceMode)
+
+	showCtx := &persona.ShowContext{
+		ShowName:        req.ShowName,
+		ShowDescription: req.ShowDescription,
+		TopicFocus:      req.TopicFocus,
+		SegmentType:     req.SegmentType,
+	}
+	base, err := b.buildHostPrompt(req.HostID, showCtx)
+	if err != nil {
+		return "", err
+	}
+	outlineJSON, err := json.MarshalIndent(outline, "", "  ")
+	if err != nil {
+		return "", fmt.Errorf("generator: marshal outline for prompt: %w", err)
+	}
+	segmentJSON, err := json.MarshalIndent(segment, "", "  ")
+	if err != nil {
+		return "", fmt.Errorf("generator: marshal outline segment for prompt: %w", err)
+	}
+
+	speakerContract := "不要使用 speaker label。请写成单主持人的自然独白。"
+	if isMultiVoiceSegment(req.SegmentType) {
+		speakerContract = "每一轮发言开头必须使用 speaker label，例如 HOST:、HOST_A:、HOST_B: 或 GUEST:。label 必须和当前段落 speakers 保持一致。"
+	}
+
+	var buf bytes.Buffer
+	if err := promptTemplates.ExecuteTemplate(&buf, "outline_segment_script.tmpl", segmentScriptPromptData{
+		BasePrompt:              base,
+		ShowName:                req.ShowName,
+		SegmentType:             req.SegmentType,
+		Topic:                   req.Topic,
+		SegmentOrdinal:          segment.Index,
+		TotalSegments:           len(outline.Segments),
+		TargetLength:            segment.TargetLength,
+		PerformanceInstructions: performancePromptInstructions(req.PerformanceMode),
+		OutlineJSON:             string(outlineJSON),
+		SegmentJSON:             string(segmentJSON),
+		SourceMaterials:         strings.TrimSpace(req.SourceMaterials),
+		NewsMaterials:           strings.TrimSpace(req.NewsMaterials),
+		PreviousTranscript:      strings.TrimSpace(previousTranscript),
+		IsFinal:                 isFinal,
+		SpeakerContract:         speakerContract,
+		RetryInstruction:        req.RetryInstruction,
+	}); err != nil {
+		return "", fmt.Errorf("generator: render outline segment script prompt: %w", err)
+	}
+	return buf.String(), nil
+}
+
 func (b *PromptBuilder) taskPrompt(req BuildRequest) (string, string, error) {
 	switch req.SegmentType {
 	case "news_analysis":
 		headlines := req.Headlines
 		if headlines == "" {
-			headlines = "暂无新闻标题，请讨论“新闻”本身是如何塑造现实感的。"
+			headlines = "暂无新闻素材。请讨论新闻叙事本身如何塑造现实感。"
 		}
 		prompt, err := renderTaskTemplate("segment_news_analysis.tmpl", taskPromptData{
 			Headlines: headlines,

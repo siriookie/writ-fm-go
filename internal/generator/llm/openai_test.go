@@ -138,3 +138,28 @@ func TestOpenAIClientGenerate(t *testing.T) {
 		})
 	}
 }
+
+func TestNormalizeOpenAIBaseURL(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{name: "root", in: "https://api.example.com", want: "https://api.example.com/v1"},
+		{name: "already v1", in: "https://api.example.com/v1", want: "https://api.example.com/v1"},
+		{name: "trailing slash", in: "https://api.example.com/v1/", want: "https://api.example.com/v1"},
+		{name: "blank", in: " ", want: ""},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := normalizeOpenAIBaseURL(tt.in); got != tt.want {
+				t.Fatalf("normalizeOpenAIBaseURL(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}

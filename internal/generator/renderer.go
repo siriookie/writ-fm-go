@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	perf "github.com/writ-fm/go/internal/generator/performance"
@@ -17,8 +18,10 @@ import (
 )
 
 const (
-	defaultChunkWords = 100
-	defaultGapSeconds = 0.3
+	defaultChunkWords           = 240
+	defaultGapSeconds           = 0.3
+	defaultConcatFadeSeconds    = 0.012
+	defaultSynthesisConcurrency = 5
 )
 
 var (
@@ -38,6 +41,9 @@ type Renderer struct {
 	tts            gentts.Client
 	backend        string
 	debugChunkDir  string
+	synthWorkers   int
+	chunkWords     int
+	concatFade     float64
 	ffmpegBin      string
 	ffprobeBin     string
 	tempDir        string
@@ -58,11 +64,38 @@ func WithChunkDebug(dir string) RendererOption {
 	}
 }
 
+func WithSynthesisConcurrency(n int) RendererOption {
+	return func(r *Renderer) {
+		if n > 0 {
+			r.synthWorkers = n
+		}
+	}
+}
+
+func WithChunkWords(n int) RendererOption {
+	return func(r *Renderer) {
+		if n > 0 {
+			r.chunkWords = n
+		}
+	}
+}
+
+func WithConcatFade(seconds float64) RendererOption {
+	return func(r *Renderer) {
+		if seconds >= 0 {
+			r.concatFade = seconds
+		}
+	}
+}
+
 // NewRenderer returns a renderer with production defaults.
 func NewRenderer(client gentts.Client, opts ...RendererOption) *Renderer {
 	renderer := &Renderer{
 		tts:            client,
 		backend:        "generic",
+		synthWorkers:   defaultSynthesisConcurrency,
+		chunkWords:     defaultChunkWords,
+		concatFade:     defaultConcatFadeSeconds,
 		ffmpegBin:      "ffmpeg",
 		ffprobeBin:     "ffprobe",
 		commandContext: exec.CommandContext,
@@ -199,7 +232,7 @@ func (r *Renderer) RenderMulti(ctx context.Context, script string, voices map[st
 		}
 		voice := speakerVoice(part.Speaker, hostVoice, guestVoice)
 		partPath := withStemSuffix(outputPath, fmt.Sprintf("_part%03d", i))
-		if countTextUnits(text) > defaultChunkWords {
+		if countTextUnits(text) > r.maxChunkWords() {
 			if err := r.renderPreparedSingle(ctx, text, voice, partPath); err != nil {
 				return err
 			}
@@ -210,6 +243,38 @@ func (r *Renderer) RenderMulti(ctx context.Context, script string, voices map[st
 	}
 	if len(rendered) == 0 {
 		return fmt.Errorf("generator/renderer: no dialogue parts rendered")
+	}
+	return r.concatenateAudio(ctx, rendered, outputPath, defaultGapSeconds)
+}
+
+// RenderParts renders outline-first script parts independently, then concatenates them.
+func (r *Renderer) RenderParts(ctx context.Context, parts []ScriptPart, voices map[string]string, outputPath string, mode PerformanceMode) error {
+	if len(parts) == 0 {
+		return fmt.Errorf("generator/renderer: no script parts to render")
+	}
+	rendered := make([]string, 0, len(parts))
+	for i, part := range parts {
+		text := strings.TrimSpace(part.Script)
+		if text == "" {
+			continue
+		}
+		partPath := withStemSuffix(outputPath, fmt.Sprintf("_segment%03d", i))
+		if partUsesMultipleVoices(part) || len(ParseDialogue(text)) > 1 {
+			if err := r.RenderMulti(ctx, text, voices, partPath, mode); err != nil {
+				r.cleanupFiles(rendered)
+				return err
+			}
+		} else {
+			voice := voiceForScriptPart(part, voices)
+			if err := r.RenderSingle(ctx, text, voice, partPath, mode); err != nil {
+				r.cleanupFiles(rendered)
+				return err
+			}
+		}
+		rendered = append(rendered, partPath)
+	}
+	if len(rendered) == 0 {
+		return fmt.Errorf("generator/renderer: no script parts rendered")
 	}
 	return r.concatenateAudio(ctx, rendered, outputPath, defaultGapSeconds)
 }
@@ -246,7 +311,7 @@ func (r *Renderer) prepareScript(script string, mode PerformanceMode) string {
 }
 
 func (r *Renderer) renderPreparedSingle(ctx context.Context, script, voice, outputPath string) error {
-	chunks := SplitIntoChunks(script, defaultChunkWords)
+	chunks := SplitIntoChunks(script, r.maxChunkWords())
 	if len(chunks) == 0 {
 		return fmt.Errorf("generator/renderer: no text to render")
 	}
@@ -259,18 +324,52 @@ func (r *Renderer) renderPreparedSingle(ctx context.Context, script, voice, outp
 }
 
 func (r *Renderer) renderChunks(ctx context.Context, chunks []string, voice, outputPath, label string) ([]string, error) {
-	files := make([]string, 0, len(chunks))
+	files := make([]string, len(chunks))
+	for i := range chunks {
+		files[i] = withStemSuffix(outputPath, fmt.Sprintf("_%s%03d", label, i))
+	}
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	limit := r.synthWorkers
+	if limit <= 0 {
+		limit = defaultSynthesisConcurrency
+	}
+	sem := make(chan struct{}, limit)
+	var wg sync.WaitGroup
+	var once sync.Once
+	var firstErr error
+
 	for i, chunk := range chunks {
-		chunkPath := withStemSuffix(outputPath, fmt.Sprintf("_%s%03d", label, i))
-		if err := r.synthesizeToFile(ctx, chunk, voice, chunkPath); err != nil {
-			r.cleanupFiles(files)
-			return nil, err
-		}
-		if err := r.debugDumpChunk(outputPath, label, i, voice, chunk, chunkPath); err != nil {
-			r.cleanupFiles(files)
-			return nil, err
-		}
-		files = append(files, chunkPath)
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(i int, chunk string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			chunkPath := files[i]
+			if err := r.synthesizeToFile(ctx, chunk, voice, chunkPath); err != nil {
+				once.Do(func() {
+					firstErr = err
+					cancel()
+				})
+				return
+			}
+			if err := r.debugDumpChunk(outputPath, label, i, voice, chunk, chunkPath); err != nil {
+				once.Do(func() {
+					firstErr = err
+					cancel()
+				})
+				return
+			}
+		}(i, chunk)
+	}
+
+	wg.Wait()
+	if firstErr != nil {
+		r.cleanupFiles(files)
+		return nil, firstErr
 	}
 	return files, nil
 }
@@ -319,7 +418,18 @@ func (r *Renderer) concatenateAudio(ctx context.Context, chunkFiles []string, ou
 		return nil
 	}
 
-	files := append([]string(nil), chunkFiles...)
+	inputFiles := append([]string(nil), chunkFiles...)
+	fadedFiles, err := r.applyConcatFades(ctx, chunkFiles, outputPath)
+	if err != nil {
+		r.cleanupFiles(chunkFiles)
+		return err
+	}
+	if len(fadedFiles) > 0 {
+		inputFiles = fadedFiles
+		defer r.cleanupFiles(fadedFiles)
+	}
+
+	files := append([]string(nil), inputFiles...)
 	if gapSeconds > 0 && len(chunkFiles) > 1 {
 		silencePath := withStemSuffix(outputPath, "_gap")
 		if err := r.generateSilence(ctx, silencePath, gapSeconds); err != nil {
@@ -327,9 +437,9 @@ func (r *Renderer) concatenateAudio(ctx context.Context, chunkFiles []string, ou
 			return err
 		}
 		var expanded []string
-		for i, file := range chunkFiles {
+		for i, file := range inputFiles {
 			expanded = append(expanded, file)
-			if i < len(chunkFiles)-1 {
+			if i < len(inputFiles)-1 {
 				expanded = append(expanded, silencePath)
 			}
 		}
@@ -352,6 +462,9 @@ func (r *Renderer) concatenateAudio(ctx context.Context, chunkFiles []string, ou
 		ctx,
 		r.ffmpegBin,
 		"-y",
+		"-hide_banner",
+		"-loglevel", "error",
+		"-nostdin",
 		"-f", "concat",
 		"-safe", "0",
 		"-i", listFile,
@@ -390,6 +503,51 @@ func (r *Renderer) writeConcatList(outputPath string, files []string) (string, e
 	return listFile, nil
 }
 
+func (r *Renderer) applyConcatFades(ctx context.Context, files []string, outputPath string) ([]string, error) {
+	if r.concatFade <= 0 || len(files) < 2 {
+		return nil, nil
+	}
+	faded := make([]string, len(files))
+	for i, file := range files {
+		fadedPath := withStemSuffix(outputPath, fmt.Sprintf("_fade%03d", i))
+		if err := r.applyEdgeFade(ctx, file, fadedPath, r.concatFade); err != nil {
+			r.cleanupFiles(faded)
+			return nil, err
+		}
+		faded[i] = fadedPath
+	}
+	return faded, nil
+}
+
+func (r *Renderer) applyEdgeFade(ctx context.Context, inputPath, outputPath string, seconds float64) error {
+	commandContext := r.commandContext
+	if commandContext == nil {
+		commandContext = exec.CommandContext
+	}
+	fade := strconv.FormatFloat(seconds, 'f', -1, 64)
+	cmd := commandContext(
+		ctx,
+		r.ffmpegBin,
+		"-y",
+		"-hide_banner",
+		"-loglevel", "error",
+		"-nostdin",
+		"-i", inputPath,
+		"-af", "afade=t=in:d="+fade+",areverse,afade=t=in:d="+fade+",areverse",
+		"-vn",
+		"-ac", "1",
+		"-ar", "24000",
+		"-c:a", "pcm_s16le",
+		outputPath,
+	)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("generator/renderer: ffmpeg fade failed: %s: %w", strings.TrimSpace(stderr.String()), err)
+	}
+	return nil
+}
+
 func (r *Renderer) generateSilence(ctx context.Context, outputPath string, seconds float64) error {
 	commandContext := r.commandContext
 	if commandContext == nil {
@@ -399,6 +557,9 @@ func (r *Renderer) generateSilence(ctx context.Context, outputPath string, secon
 		ctx,
 		r.ffmpegBin,
 		"-y",
+		"-hide_banner",
+		"-loglevel", "error",
+		"-nostdin",
 		"-f", "lavfi",
 		"-i", "anullsrc=r=24000:cl=mono",
 		"-t", strconv.FormatFloat(seconds, 'f', -1, 64),
@@ -413,8 +574,18 @@ func (r *Renderer) generateSilence(ctx context.Context, outputPath string, secon
 	return nil
 }
 
+func (r *Renderer) maxChunkWords() int {
+	if r.chunkWords > 0 {
+		return r.chunkWords
+	}
+	return defaultChunkWords
+}
+
 func (r *Renderer) cleanupFiles(paths []string) {
 	for _, path := range paths {
+		if strings.TrimSpace(path) == "" {
+			continue
+		}
 		_ = os.Remove(path)
 	}
 }
@@ -465,6 +636,27 @@ func speakerVoice(speaker, hostVoice, guestVoice string) string {
 	default:
 		return hostVoice
 	}
+}
+
+func partUsesMultipleVoices(part ScriptPart) bool {
+	seen := map[string]bool{}
+	for _, speaker := range part.Speakers {
+		speaker = strings.ToUpper(strings.TrimSpace(speaker))
+		if speaker == "" {
+			continue
+		}
+		seen[speaker] = true
+	}
+	return len(seen) > 1
+}
+
+func voiceForScriptPart(part ScriptPart, voices map[string]string) string {
+	hostVoice := firstNonEmpty(voices["host"], "am_michael")
+	guestVoice := firstNonEmpty(voices["guest"], "af_bella")
+	if len(part.Speakers) == 0 {
+		return hostVoice
+	}
+	return speakerVoice(strings.ToUpper(strings.TrimSpace(part.Speakers[0])), hostVoice, guestVoice)
 }
 
 func withStemSuffix(path, suffix string) string {

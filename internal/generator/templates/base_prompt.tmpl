@@ -2,10 +2,29 @@
 
 内容类型：{{.SegmentType}}
 主题：{{.Topic}}
-目标长度：约 {{.TargetMin}}-{{.TargetMax}} 字
-长度要求：{{.LengthInstructions}}
-输出要求：{{.OutputInstructions}}
+目标长度：约 {{.TargetMin}}-{{.TargetMax}} 个中文字或等价文本单位
+
+长度要求：
+{{.LengthInstructions}}
+
+输出要求：
+{{.OutputInstructions}}
+
 表演控制要求：
 {{.PerformanceInstructions}}
+
+重要任务约束：
+- 你必须直接写出一整段已经可以播出的完整中文口播正文。
+- 不要反问用户，不要等待用户提供更多信息，不要只做主持人开场。
+- 不要写“你想聊什么”“请告诉我主题”“下面是稿件”等元话语。
+- 如果素材不足，也要基于当前主题完成一篇完整节目稿。{{if .SourceMaterials}}
+
+本期 source materials：
+下面是本期内容的事实、故事大纲、笔记或参考材料。它不是装饰信息，而是正文的主要依据；请从中提取人物、事件、顺序、细节、矛盾和可展开的场景。
+你必须优先围绕 source materials 展开，不要只凭主题泛泛发挥。
+<source_materials>
+{{.SourceMaterials}}
+</source_materials>
+{{end}}
 
 {{.TaskPrompt}}

@@ -1,6 +1,12 @@
 package generator
 
-import "math/rand"
+import (
+	"math/rand"
+	"regexp"
+	"strings"
+)
+
+var formattedHeadlineTitleRE = regexp.MustCompile(`(?m)^\s*\d+\.\s*\[[^\]]+\]\s*([^\r\n]+)\s*$`)
 
 // InterviewGuest is a fictional/composite guest profile for interview segments.
 type InterviewGuest struct {
@@ -15,21 +21,22 @@ var TopicPools = map[string][]string{
 		"大众媒介里的亲密幻觉，我们为何会对陌生声音产生依赖",
 		"记忆考古学，一首歌如何把被埋住的过去重新挖出来",
 		"灵魂的候车室，我们栖居过的那些过渡地带",
-		"失眠的民主，今晚还有谁和你一起醒着",
+		"失眠的民众，今晚还有谁和你一起醒着",
 	},
 	"music_history": {
-		"B 面秘史，被随手塞过去的歌为什么后来成了经典",
+		"B 面时代，被随手塞过去的歌为什么后来成了经典",
 		"地理如何塑造声音，哪些城市发明了新的音乐语法",
 		"录音室也是乐器，那些塑造了时代音色的房间",
 		"海盗电台的黄金年代，空气中的亡命之徒与自由声音",
 		"DJ 作为策展人，选择与排序为什么本身就是创作",
 	},
 	"current_events": {
-		"这周的标题党没有告诉你的那部分现实",
-		"注意力经济，谁在从我们的分心中获利",
-		"技术与信任，那场还没被说透的危机",
-		"气候报告里的紧迫语言，为什么越准确越难被听见",
-		"当世界不断加速，新闻业还能如何保持诚实",
+		"这组新闻背后的责任链：谁在行动，谁在解释，谁在承担后果",
+		"突发事件里的信息真空：确认、推断和政治叙事如何抢夺同一个现场",
+		"从一条新闻看制度反应：执法、媒体、公众和利益方各自做了什么",
+		"当新闻进入全球供应链：企业、市场和政策压力如何重新分配风险",
+		"今天的公共议题里，哪些问题被标题盖住了，哪些证据还不够",
+		"从最新 RSS 材料拆一条事实链：时间线、利益关系和下一步变量",
 	},
 	"culture": {
 		"咖啡馆为何会成为第三空间，陌生人如何慢慢变成熟面孔",
@@ -41,7 +48,7 @@ var TopicPools = map[string][]string{
 	"soul_music": {
 		"一首歌为什么会有灵魂，Soul 从来不只是曲风分类",
 		"支撑每一道 groove 的福音根系",
-		"放克也是一种哲学，Parliament 为什么像一艘宇宙母舰",
+		"放克也是一种哲学，Parliament 为什么像一艘宇宙母船",
 		"Erykah Badu 与她的气场教会",
 		"迪斯科的死亡与复活，谁曾关掉舞池，又是谁重新点亮它",
 	},
@@ -85,6 +92,49 @@ func selectTopicWithRand(topicFocus string, randIntn func(int) int) string {
 		return ""
 	}
 	return pool[randIntn(len(pool))]
+}
+
+func deriveNewsAnalysisTopic(headlines string) string {
+	titles := extractFormattedHeadlineTitles(headlines, 3)
+	if len(titles) == 0 {
+		return "根据今日 RSS 材料，自行判断最值得普通人搞清楚的一条新闻主线"
+	}
+	if len(titles) == 1 {
+		return "从「" + titles[0] + "」讲清这条新闻背后的关键问题"
+	}
+	return "根据今日 RSS 材料，自行判断最值得分析的新闻主线；优先比较「" + titles[0] + "」和「" + titles[1] + "」之间的关联、差异与责任链"
+}
+
+func extractFormattedHeadlineTitles(headlines string, maxItems int) []string {
+	if maxItems <= 0 {
+		return nil
+	}
+	matches := formattedHeadlineTitleRE.FindAllStringSubmatch(headlines, -1)
+	titles := make([]string, 0, min(maxItems, len(matches)))
+	for _, match := range matches {
+		if len(match) < 2 {
+			continue
+		}
+		title := cleanHeadlineTitle(match[1])
+		if title == "" {
+			continue
+		}
+		titles = append(titles, title)
+		if len(titles) >= maxItems {
+			break
+		}
+	}
+	return titles
+}
+
+func cleanHeadlineTitle(title string) string {
+	title = strings.TrimSpace(strings.Join(strings.Fields(title), " "))
+	title = strings.Trim(title, "「」“”\"'")
+	runes := []rune(title)
+	if len(runes) > 42 {
+		title = string(runes[:42]) + "…"
+	}
+	return title
 }
 
 func randomInterviewGuest() InterviewGuest {

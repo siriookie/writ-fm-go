@@ -6,9 +6,9 @@ timezone: local
 shows:
   midnight_signal:
     name: "Midnight Signal"
-    description: "Philosophy, memory, and the transmissions that only come through after midnight."
+    description: "午夜故事节目。讲述人物、事件和那些慢慢浮出水面的细节。"
     host: "liminal_operator"
-    topic_focus: "philosophy"
+    topic_focus: "storytelling"
     segment_types: ["deep_dive", "story", "interview", "listener_mailbag"]
     bumper_style: "ambient"
     voices:
@@ -46,7 +46,7 @@ shows:
 
   signal_report:
     name: "Signal Report"
-    description: "Current events decoded. The news behind the news, through a late-night lens."
+    description: "不止复述新闻，而是讲清新闻的结构、责任与现实。"
     host: "signal"
     topic_focus: "current_events"
     segment_types: ["news_analysis", "deep_dive", "panel"]

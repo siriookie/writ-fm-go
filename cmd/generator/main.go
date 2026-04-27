@@ -31,6 +31,14 @@ var (
 	focusFlag           string
 	performanceModeFlag string
 	debugScriptFlag     bool
+	sourceFilesFlag     []string
+	sourceDirsFlag      []string
+	sourceRootFlag      string
+	sourceTextFlag      string
+	youtubeURLsFlag     []string
+	youtubeURLFileFlag  string
+	youtubeLangsFlag    string
+	ingestOutDirFlag    string
 )
 
 var (
@@ -54,7 +62,32 @@ var generateCmd = &cobra.Command{
 		cfg := configFromEnv()
 		ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 		defer stop()
-		return runGenerate(ctx, cfg, showFlag, typeFlag, topicFlag, countFlag)
+		sourceMaterials, err := buildSourceMaterials(ctx, sourceFilesFlag, sourceDirsForType(sourceRootFlag, typeFlag, sourceDirsFlag), sourceTextFlag, youtubeURLsFlag, youtubeLangsFlag)
+		if err != nil {
+			return err
+		}
+		return runGenerate(ctx, cfg, showFlag, typeFlag, topicFlag, sourceMaterials, countFlag)
+	},
+}
+
+var ingestYouTubeCmd = &cobra.Command{
+	Use:   "ingest-youtube",
+	Short: "Extract YouTube transcripts into reusable source material files",
+	RunE: func(cmd *cobra.Command, args []string) error {
+		urls, err := collectYouTubeURLs(youtubeURLsFlag, youtubeURLFileFlag)
+		if err != nil {
+			return err
+		}
+		if len(urls) == 0 {
+			return errors.New("provide at least one --youtube-url or --youtube-url-file")
+		}
+		ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+		defer stop()
+		outDir := strings.TrimSpace(ingestOutDirFlag)
+		if outDir == "" {
+			outDir = typeSourceDir(sourceRootFlag, typeFlag)
+		}
+		return runIngestYouTube(ctx, urls, outDir, youtubeLangsFlag, os.Stdout)
 	},
 }
 
@@ -100,6 +133,12 @@ func init() {
 	generateCmd.Flags().StringVar(&showFlag, "show", "", "show ID to generate for (defaults to current show)")
 	generateCmd.Flags().StringVar(&typeFlag, "type", "", "specific segment type to generate")
 	generateCmd.Flags().StringVar(&topicFlag, "topic", "", "specific topic to use")
+	generateCmd.Flags().StringArrayVar(&sourceFilesFlag, "source-file", nil, "source material file to ground the episode; may be repeated")
+	generateCmd.Flags().StringArrayVar(&sourceDirsFlag, "source-dir", nil, "directory of source material files to ground the episode; may be repeated")
+	generateCmd.Flags().StringVar(&sourceRootFlag, "source-root", "", "root directory for type-specific source materials (default: GENERATOR_SOURCE_ROOT or sources)")
+	generateCmd.Flags().StringVar(&sourceTextFlag, "source-text", "", "inline source material to ground the episode")
+	generateCmd.Flags().StringArrayVar(&youtubeURLsFlag, "youtube-url", nil, "YouTube URL to extract transcript source material with yt-dlp; may be repeated")
+	generateCmd.Flags().StringVar(&youtubeLangsFlag, "youtube-langs", "", "comma-separated YouTube transcript language priority (default: YOUTUBE_TRANSCRIPT_LANGS or en-en,en-AU,en-CA,en-IN,en-IE,en-GB,en-US,en-orig)")
 	generateCmd.Flags().IntVar(&countFlag, "count", 1, "number of segments to generate")
 	generateCmd.Flags().StringVar(&performanceModeFlag, "performance-mode", "constrained", "performance cue mode: constrained or expressive")
 	generateCmd.Flags().BoolVar(&debugScriptFlag, "debug-script", false, "log the raw generated script before TTS rendering")
@@ -111,7 +150,14 @@ func init() {
 
 	listTopicsCmd.Flags().StringVar(&focusFlag, "focus", "", "topic focus to list")
 
-	rootCmd.AddCommand(generateCmd, generateAllCmd, statusCmd, listTypesCmd, listTopicsCmd)
+	ingestYouTubeCmd.Flags().StringArrayVar(&youtubeURLsFlag, "youtube-url", nil, "YouTube URL to extract transcript source material with yt-dlp; may be repeated")
+	ingestYouTubeCmd.Flags().StringVar(&youtubeURLFileFlag, "youtube-url-file", "", "file containing one YouTube URL per line")
+	ingestYouTubeCmd.Flags().StringVar(&youtubeLangsFlag, "youtube-langs", "", "comma-separated YouTube transcript language priority (default: YOUTUBE_TRANSCRIPT_LANGS or en-en,en-AU,en-CA,en-IN,en-IE,en-GB,en-US,en-orig)")
+	ingestYouTubeCmd.Flags().StringVar(&typeFlag, "type", "", "segment type source folder to write into, such as story or deep_dive")
+	ingestYouTubeCmd.Flags().StringVar(&sourceRootFlag, "source-root", "", "root directory for type-specific source materials (default: GENERATOR_SOURCE_ROOT or sources)")
+	ingestYouTubeCmd.Flags().StringVar(&ingestOutDirFlag, "out-dir", "", "explicit output directory for extracted transcript files")
+
+	rootCmd.AddCommand(generateCmd, ingestYouTubeCmd, generateAllCmd, statusCmd, listTypesCmd, listTopicsCmd)
 }
 
 func main() {
@@ -120,7 +166,7 @@ func main() {
 	}
 }
 
-func runGenerate(ctx context.Context, cfg config, showID, segmentType, topic string, count int) error {
+func runGenerate(ctx context.Context, cfg config, showID, segmentType, topic, sourceMaterials string, count int) error {
 	sched, err := loadScheduleFn(cfg.SchedulePath)
 	if err != nil {
 		return fmt.Errorf("load schedule: %w", err)
@@ -139,7 +185,7 @@ func runGenerate(ctx context.Context, cfg config, showID, segmentType, topic str
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		req, err := buildGenerateRequest(show, segmentType, topic)
+		req, err := buildGenerateRequest(show, segmentType, topic, sourceMaterials)
 		if err != nil {
 			return err
 		}
@@ -180,7 +226,7 @@ func runGenerateAll(ctx context.Context, cfg config, min int, segmentType string
 		}
 		log.Printf("generator: %s has %d segments, generating %d more", show.ShowID, have, need)
 		for i := range need {
-			req, err := buildGenerateRequest(show, segmentType, "")
+			req, err := buildGenerateRequest(show, segmentType, "", "")
 			if err != nil {
 				return err
 			}
@@ -298,7 +344,7 @@ type schedulerShow struct {
 	Voices       map[string]string
 }
 
-func buildGenerateRequest(show *schedulerShow, segmentType, topic string) (gen.GenerateRequest, error) {
+func buildGenerateRequest(show *schedulerShow, segmentType, topic, sourceMaterials string) (gen.GenerateRequest, error) {
 	segmentType = strings.TrimSpace(segmentType)
 	if segmentType == "" {
 		if len(show.SegmentTypes) == 0 {
@@ -314,9 +360,157 @@ func buildGenerateRequest(show *schedulerShow, segmentType, topic string) (gen.G
 		TopicFocus:      show.TopicFocus,
 		SegmentType:     segmentType,
 		Topic:           topic,
+		SourceMaterials: strings.TrimSpace(sourceMaterials),
 		Voices:          cloneVoices(show.Voices),
 		PerformanceMode: gen.NormalizePerformanceMode(gen.PerformanceMode(performanceModeFlag)),
 	}, nil
+}
+
+type sourceDirSpec struct {
+	Path    string
+	PickOne bool
+}
+
+func buildSourceMaterials(ctx context.Context, files []string, dirs []sourceDirSpec, inline string, youtubeURLs []string, youtubeLangs string) (string, error) {
+	var blocks []string
+	if trimmed := strings.TrimSpace(inline); trimmed != "" {
+		blocks = append(blocks, formatSourceBlock("inline", trimmed, 20000))
+	}
+	for _, file := range files {
+		file = strings.TrimSpace(file)
+		if file == "" {
+			continue
+		}
+		data, err := os.ReadFile(file)
+		if err != nil {
+			return "", fmt.Errorf("read source file %q: %w", file, err)
+		}
+		blocks = append(blocks, formatSourceBlock(filepath.Base(file), string(data), 30000))
+	}
+	dirFiles, err := sourceFilesFromDirs(dirs)
+	if err != nil {
+		return "", err
+	}
+	for _, file := range dirFiles {
+		data, err := os.ReadFile(file)
+		if err != nil {
+			return "", fmt.Errorf("read source file %q: %w", file, err)
+		}
+		blocks = append(blocks, formatSourceBlock(filepath.Base(file), string(data), 30000))
+	}
+	langs := preferredYouTubeLangs(youtubeLangs)
+	for _, rawURL := range youtubeURLs {
+		rawURL = strings.TrimSpace(rawURL)
+		if rawURL == "" {
+			continue
+		}
+		block, err := extractYouTubeSourceMaterial(ctx, rawURL, langs)
+		if err != nil {
+			return "", fmt.Errorf("extract youtube source %q: %w", rawURL, err)
+		}
+		blocks = append(blocks, formatSourceBlock(block.Name, block.Text, 50000))
+	}
+	return strings.TrimSpace(strings.Join(blocks, "\n\n")), nil
+}
+
+func sourceFilesFromDirs(dirs []sourceDirSpec) ([]string, error) {
+	seen := make(map[string]struct{})
+	var files []string
+	for _, spec := range dirs {
+		dir := strings.TrimSpace(spec.Path)
+		if dir == "" {
+			continue
+		}
+		entries, err := os.ReadDir(dir)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("read source dir %q: %w", dir, err)
+		}
+		var dirFiles []string
+		for _, entry := range entries {
+			if entry.IsDir() || !isSourceMaterialFile(entry.Name()) {
+				continue
+			}
+			path := filepath.Join(dir, entry.Name())
+			dirFiles = append(dirFiles, path)
+		}
+		slices.Sort(dirFiles)
+		if spec.PickOne && len(dirFiles) > 1 {
+			dirFiles = []string{dirFiles[rand.Intn(len(dirFiles))]}
+		}
+		for _, path := range dirFiles {
+			if _, ok := seen[path]; ok {
+				continue
+			}
+			seen[path] = struct{}{}
+			files = append(files, path)
+		}
+	}
+	slices.Sort(files)
+	return files, nil
+}
+
+func isSourceMaterialFile(name string) bool {
+	switch strings.ToLower(filepath.Ext(name)) {
+	case ".md", ".markdown", ".txt", ".text":
+		return true
+	default:
+		return false
+	}
+}
+
+func sourceDirsForType(root, segmentType string, explicit []string) []sourceDirSpec {
+	dirs := make([]sourceDirSpec, 0, len(explicit)+2)
+	for _, dir := range explicit {
+		dirs = append(dirs, sourceDirSpec{Path: dir, PickOne: true})
+	}
+	resolvedRoot := sourceRoot(root)
+	if resolvedRoot == "" {
+		return dirs
+	}
+	dirs = append(dirs, sourceDirSpec{Path: filepath.Join(resolvedRoot, "common"), PickOne: false})
+	if strings.TrimSpace(segmentType) != "" {
+		dirs = append(dirs, sourceDirSpec{Path: typeSourceDir(resolvedRoot, segmentType), PickOne: true})
+	}
+	return dirs
+}
+
+func sourceRoot(raw string) string {
+	if strings.TrimSpace(raw) != "" {
+		return strings.TrimSpace(raw)
+	}
+	if env := strings.TrimSpace(os.Getenv("GENERATOR_SOURCE_ROOT")); env != "" {
+		return env
+	}
+	return "sources"
+}
+
+func typeSourceDir(root, segmentType string) string {
+	root = sourceRoot(root)
+	segmentType = strings.TrimSpace(segmentType)
+	if segmentType == "" {
+		segmentType = "youtube"
+	}
+	return filepath.Join(root, segmentType)
+}
+
+func formatSourceBlock(name, text string, maxRunes int) string {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return ""
+	}
+	runes := []rune(text)
+	truncated := false
+	if maxRunes > 0 && len(runes) > maxRunes {
+		text = string(runes[:maxRunes])
+		truncated = true
+	}
+	if truncated {
+		text += "..."
+	}
+	return fmt.Sprintf("## %s\n%s", name, text)
 }
 
 func countSegments(outputDir, showID string) int {

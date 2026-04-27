@@ -20,8 +20,9 @@ import (
 
 var (
 	// ErrScriptTooShort is returned when the generated script fails the quality gate.
-	ErrScriptTooShort = errors.New("generator: script too short")
-	slugNoiseRE       = regexp.MustCompile(`[^a-z0-9]+`)
+	ErrScriptTooShort        = errors.New("generator: script too short")
+	errOutlineGenerationFail = errors.New("generator: outline generation failed")
+	slugNoiseRE              = regexp.MustCompile(`[^a-z0-9]+`)
 )
 
 // GenerateRequest is the input for one script generation job.
@@ -33,7 +34,10 @@ type GenerateRequest struct {
 	TopicFocus      string
 	SegmentType     string
 	Topic           string
+	SourceMaterials string
 	Headlines       string
+	NewsMaterials   string
+	NewsItems       []news.Headline
 	GuestName       string
 	GuestContext    string
 	Voices          map[string]string
@@ -47,10 +51,14 @@ type ScriptMetadata struct {
 	ShowName        string            `json:"show_name"`
 	Host            string            `json:"host"`
 	Topic           string            `json:"topic"`
+	SourceMaterials string            `json:"source_materials,omitempty"`
 	Script          string            `json:"script"`
 	WordCount       int               `json:"word_count"`
 	DurationSeconds *float64          `json:"duration_seconds"`
 	Voices          map[string]string `json:"voices,omitempty"`
+	GenerationMode  string            `json:"generation_mode"`
+	Outline         *Outline          `json:"outline,omitempty"`
+	Segments        []OutlineSegment  `json:"segments,omitempty"`
 	GeneratedAt     time.Time         `json:"generated_at"`
 	AudioPath       string            `json:"audio_path"`
 	Status          string            `json:"status"`
@@ -58,13 +66,14 @@ type ScriptMetadata struct {
 
 // Result is the output of a successful generation run.
 type Result struct {
-	Prompt       string
-	Script       string
-	Topic        string
-	AudioPath    string
-	MetadataPath string
-	WordCount    int
-	Duration     float64
+	Prompt          string
+	Script          string
+	Topic           string
+	SourceMaterials string
+	AudioPath       string
+	MetadataPath    string
+	WordCount       int
+	Duration        float64
 }
 
 // LLMClient is the subset of llm.Client used by the generator core.
@@ -76,12 +85,17 @@ type LLMClient interface {
 type AudioRenderer interface {
 	RenderSingle(ctx context.Context, script, voice, outputPath string, mode PerformanceMode) error
 	RenderMulti(ctx context.Context, script string, voices map[string]string, outputPath string, mode PerformanceMode) error
+	RenderParts(ctx context.Context, parts []ScriptPart, voices map[string]string, outputPath string, mode PerformanceMode) error
 	Duration(ctx context.Context, path string) (float64, error)
 }
 
 // HeadlineProvider fetches current news headlines for prompt injection.
 type HeadlineProvider interface {
 	FetchHeadlines(ctx context.Context) ([]news.Headline, error)
+}
+
+type ArticleFetcher interface {
+	FetchArticle(ctx context.Context, item news.Headline) (news.Headline, error)
 }
 
 // Generator orchestrates prompt building, LLM calls, quality gates, rendering, and metadata persistence.
@@ -92,6 +106,7 @@ type Generator struct {
 	talkSegmentsDir string
 	scriptsDir      string
 	promptBuilder   *PromptBuilder
+	outlineMode     string
 	topicPicker     func(string) string
 	idGen           func() string
 	now             func() time.Time
@@ -117,6 +132,7 @@ func New(client LLMClient, renderer AudioRenderer, ttsBackend, talkSegmentsDir, 
 		talkSegmentsDir: talkSegmentsDir,
 		scriptsDir:      scriptsDir,
 		promptBuilder:   NewPromptBuilder(),
+		outlineMode:     OutlineModeAuto,
 		topicPicker:     SelectTopic,
 		idGen:           defaultID,
 		now:             time.Now,
@@ -127,31 +143,42 @@ func New(client LLMClient, renderer AudioRenderer, ttsBackend, talkSegmentsDir, 
 	return g
 }
 
+// WithOutlineMode configures outline-first generation.
+func WithOutlineMode(mode string) Option {
+	return func(g *Generator) {
+		g.outlineMode = normalizeOutlineMode(mode)
+	}
+}
+
 // Generate creates a script, renders audio, and persists metadata.
 func (g *Generator) Generate(ctx context.Context, req GenerateRequest) (*Result, error) {
-	if req.Topic == "" {
-		req.Topic = g.topicPicker(req.TopicFocus)
+	if strings.TrimSpace(req.Topic) == "" && req.SegmentType != "news_analysis" {
+		if strings.TrimSpace(req.SourceMaterials) != "" {
+			req.Topic = deriveTopicFromSourceMaterials(req.SourceMaterials)
+		} else {
+			req.Topic = g.topicPicker(req.TopicFocus)
+		}
 	}
 	if err := g.injectHeadlines(ctx, &req); err != nil {
 		return nil, err
+	}
+	if strings.TrimSpace(req.Topic) == "" {
+		req.Topic = g.pickTopic(req)
 	}
 
 	promptReq := BuildRequest{
 		HostID:          req.HostID,
 		SegmentType:     req.SegmentType,
 		Topic:           req.Topic,
+		SourceMaterials: req.SourceMaterials,
 		ShowName:        req.ShowName,
 		ShowDescription: req.ShowDescription,
 		TopicFocus:      req.TopicFocus,
 		Headlines:       req.Headlines,
+		NewsMaterials:   req.NewsMaterials,
 		GuestName:       req.GuestName,
 		GuestContext:    req.GuestContext,
 		PerformanceMode: req.PerformanceMode,
-	}
-
-	prompt, script, wordCount, err := g.generateScript(ctx, req.SegmentType, promptReq)
-	if err != nil {
-		return nil, err
 	}
 
 	voices, err := g.resolveVoices(req)
@@ -164,37 +191,224 @@ func (g *Generator) Generate(ctx context.Context, req GenerateRequest) (*Result,
 		return nil, err
 	}
 
+	if shouldUseOutlineFirst(g.outlineMode, req.SegmentType) {
+		result, err := g.generateWithOutline(ctx, req, promptReq, voices, audioPath, metadataPath)
+		if err == nil {
+			return result, nil
+		}
+		return nil, err
+	}
+
+	prompt, script, wordCount, err := g.generateScript(ctx, req.SegmentType, promptReq)
+	if err != nil {
+		return nil, err
+	}
 	duration, err := g.renderAudio(ctx, req.SegmentType, script, voices, audioPath, req.PerformanceMode)
 	if err != nil {
 		return nil, err
 	}
 
-	if err := g.writeMetadata(req, script, wordCount, duration, voices, audioPath, metadataPath); err != nil {
+	if err := g.writeMetadata(req, script, wordCount, duration, voices, audioPath, metadataPath, GenerationModeSingleShot, nil, nil); err != nil {
 		return nil, err
 	}
 
 	return &Result{
-		Prompt:       prompt,
-		Script:       script,
-		Topic:        req.Topic,
-		AudioPath:    audioPath,
-		MetadataPath: metadataPath,
-		WordCount:    wordCount,
-		Duration:     duration,
+		Prompt:          prompt,
+		Script:          script,
+		Topic:           req.Topic,
+		SourceMaterials: req.SourceMaterials,
+		AudioPath:       audioPath,
+		MetadataPath:    metadataPath,
+		WordCount:       wordCount,
+		Duration:        duration,
 	}, nil
 }
 
+func (g *Generator) pickTopic(req GenerateRequest) string {
+	if req.SegmentType == "news_analysis" && strings.TrimSpace(req.Headlines) != "" {
+		return deriveNewsAnalysisTopic(req.Headlines)
+	}
+	return g.topicPicker(req.TopicFocus)
+}
+
+func (g *Generator) generateWithOutline(ctx context.Context, req GenerateRequest, promptReq BuildRequest, voices map[string]string, audioPath, metadataPath string) (*Result, error) {
+	outlinePrompt, outline, err := g.generateOutline(ctx, req.SegmentType, promptReq)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", errOutlineGenerationFail, err)
+	}
+	if req.SegmentType == "news_analysis" {
+		promptReq.NewsMaterials = g.materialsForSelectedNews(ctx, req, outline)
+	}
+
+	segments, scripts, err := g.generateSegmentScripts(ctx, promptReq, outline)
+	if err != nil {
+		return nil, fmt.Errorf("%w: segment script generation: %v", errOutlineGenerationFail, err)
+	}
+	script := strings.Join(scripts, "\n\n")
+	wordCount := countTextUnits(script)
+	if err := validateFinalScriptLength(req.SegmentType, script); err != nil {
+		return nil, fmt.Errorf("%w: final outline script: %v", errOutlineGenerationFail, err)
+	}
+
+	parts := make([]ScriptPart, 0, len(segments))
+	for _, segment := range segments {
+		parts = append(parts, ScriptPart{
+			Index:    segment.Index,
+			Title:    segment.Title,
+			Script:   segment.Script,
+			Speakers: append([]string(nil), segment.Speakers...),
+		})
+	}
+	duration, err := g.renderScriptParts(ctx, parts, voices, audioPath, req.PerformanceMode)
+	if err != nil {
+		return nil, err
+	}
+
+	metaOutline := cloneOutline(outline)
+	metaOutline.Segments = segments
+	if err := g.writeMetadata(req, script, wordCount, duration, voices, audioPath, metadataPath, GenerationModeOutlineFirst, metaOutline, segments); err != nil {
+		return nil, err
+	}
+
+	return &Result{
+		Prompt:          outlinePrompt,
+		Script:          script,
+		Topic:           req.Topic,
+		SourceMaterials: req.SourceMaterials,
+		AudioPath:       audioPath,
+		MetadataPath:    metadataPath,
+		WordCount:       wordCount,
+		Duration:        duration,
+	}, nil
+}
+
+func (g *Generator) generateOutline(ctx context.Context, segmentType string, buildReq BuildRequest) (string, *Outline, error) {
+	var lastErr error
+	lastPrompt := ""
+	for attempt := 0; attempt < defaultMaxAttempts; attempt++ {
+		prompt, err := g.promptBuilder.BuildOutlinePrompt(buildReq)
+		if err != nil {
+			return "", nil, err
+		}
+		lastPrompt = prompt
+		raw, err := g.llm.Generate(ctx, prompt)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		outline, err := parseOutline(raw, segmentType)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		return lastPrompt, outline, nil
+	}
+	if lastErr == nil {
+		lastErr = llm.ErrEmptyResponse
+	}
+	return lastPrompt, nil, lastErr
+}
+
+func (g *Generator) generateSegmentScripts(ctx context.Context, buildReq BuildRequest, outline *Outline) ([]OutlineSegment, []string, error) {
+	segments := make([]OutlineSegment, len(outline.Segments))
+	scripts := make([]string, len(outline.Segments))
+	for i, segment := range outline.Segments {
+		previousTranscript := strings.Join(scripts[:i], "\n\n")
+		isFinal := i == len(outline.Segments)-1
+		generated, err := g.generateOneSegmentScript(ctx, buildReq, outline, segment, previousTranscript, isFinal)
+		if err != nil {
+			return nil, nil, err
+		}
+		segment.Script = generated
+		segment.WordCount = countTextUnits(generated)
+		segments[i] = segment
+		scripts[i] = generated
+	}
+	return segments, scripts, nil
+}
+
+func (g *Generator) generateOneSegmentScript(ctx context.Context, buildReq BuildRequest, outline *Outline, segment OutlineSegment, previousTranscript string, isFinal bool) (string, error) {
+	var lastErr error
+	for attempt := 0; attempt < defaultMaxAttempts; attempt++ {
+		req := buildReq
+		if attempt > 0 {
+			req.RetryInstruction = fmt.Sprintf("上一轮没有生成可用正文。请只重写当前 outline 段落的最终中文口播正文，目标约 %d 个中文字或等价文本单位。即使 source materials 是英文，也必须改写成自然中文讲述，不要输出英文段落或英文 transcript。", segment.TargetLength)
+		}
+		prompt, err := g.promptBuilder.BuildSegmentScriptPrompt(req, outline, segment, previousTranscript, isFinal)
+		if err != nil {
+			return "", err
+		}
+		script, err := g.llm.Generate(ctx, prompt)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if strings.TrimSpace(script) == "" || countTextUnits(script) == 0 {
+			lastErr = fmt.Errorf("segment %d returned empty script", segment.Index)
+			continue
+		}
+		if err := validateChineseScript(script); err != nil {
+			lastErr = fmt.Errorf("segment %d must be Chinese: %w", segment.Index, err)
+			continue
+		}
+		return script, nil
+	}
+	if lastErr == nil {
+		lastErr = llm.ErrEmptyResponse
+	}
+	return "", lastErr
+}
+
+func validateFinalScriptLength(segmentType, script string) error {
+	target, ok := SegmentLengthTargets[segmentType]
+	if !ok {
+		target = SegmentLengthTargets["deep_dive"]
+	}
+	gate := newQualityGate(target)
+	units := countTextUnits(script)
+	if !gate.accepted(units, gate.maxAttempts-1) {
+		return fmt.Errorf("%w: got %d text units, need at least %d, sample=%q", ErrScriptTooShort, units, gate.minimumForAttempt(gate.maxAttempts-1), responseSnippet(script))
+	}
+	return nil
+}
+
 func (g *Generator) injectHeadlines(ctx context.Context, req *GenerateRequest) error {
-	if req == nil || req.SegmentType != "news_analysis" || strings.TrimSpace(req.Headlines) != "" || g.headlines == nil {
+	if req == nil || req.SegmentType != "news_analysis" || strings.TrimSpace(req.Headlines) != "" {
 		return nil
+	}
+	if g.headlines == nil {
+		return fmt.Errorf("generator: news_analysis requires RSS materials but no headline provider is configured")
 	}
 
 	headlines, err := g.headlines.FetchHeadlines(ctx)
 	if err != nil {
-		return nil
+		return fmt.Errorf("generator: fetch RSS materials for news_analysis: %w", err)
 	}
-	req.Headlines = news.FormatHeadlines(headlines, 8)
+	formatted := strings.TrimSpace(news.FormatHeadlines(headlines, 8))
+	if formatted == "" {
+		return fmt.Errorf("generator: no RSS materials available for news_analysis")
+	}
+	req.Headlines = formatted
+	req.NewsItems = cloneNewsHeadlines(headlines)
+	req.NewsMaterials = strings.TrimSpace(news.FormatDetailedMaterials(headlines[:1], 1, 1800))
 	return nil
+}
+
+func (g *Generator) materialsForSelectedNews(ctx context.Context, req GenerateRequest, outline *Outline) string {
+	if outline == nil || len(req.NewsItems) == 0 {
+		return strings.TrimSpace(req.NewsMaterials)
+	}
+	index := outline.SelectedItemIndex
+	if index < 1 || index > len(req.NewsItems) {
+		index = 1
+	}
+	selected := req.NewsItems[index-1]
+	if fetcher, ok := g.headlines.(ArticleFetcher); ok {
+		if enriched, err := fetcher.FetchArticle(ctx, selected); err == nil {
+			selected = enriched
+		}
+	}
+	return strings.TrimSpace(news.FormatDetailedMaterials([]news.Headline{selected}, 1, 3600))
 }
 
 func (g *Generator) generateScript(ctx context.Context, segmentType string, buildReq BuildRequest) (string, string, int, error) {
@@ -227,7 +441,11 @@ func (g *Generator) generateScript(ctx context.Context, segmentType string, buil
 		wordCount := countTextUnits(script)
 		lastUnits = wordCount
 		if !gate.accepted(wordCount, attempt) {
-			lastErr = fmt.Errorf("%w: got %d text units, need at least %d", ErrScriptTooShort, wordCount, gate.minimumForAttempt(attempt))
+			lastErr = fmt.Errorf("%w: got %d text units, need at least %d, sample=%q", ErrScriptTooShort, wordCount, gate.minimumForAttempt(attempt), responseSnippet(script))
+			continue
+		}
+		if err := validateChineseScript(script); err != nil {
+			lastErr = fmt.Errorf("script must be Chinese: %w", err)
 			continue
 		}
 		return lastPrompt, script, wordCount, nil
@@ -258,7 +476,7 @@ func (g *Generator) allocatePaths(req GenerateRequest) (string, string, error) {
 	return audioPath, metadataPath, nil
 }
 
-func (g *Generator) writeMetadata(req GenerateRequest, script string, wordCount int, duration float64, voices map[string]string, audioPath, metadataPath string) error {
+func (g *Generator) writeMetadata(req GenerateRequest, script string, wordCount int, duration float64, voices map[string]string, audioPath, metadataPath, generationMode string, outline *Outline, segments []OutlineSegment) error {
 	now := g.now()
 	meta := ScriptMetadata{
 		Type:            req.SegmentType,
@@ -266,10 +484,14 @@ func (g *Generator) writeMetadata(req GenerateRequest, script string, wordCount 
 		ShowName:        req.ShowName,
 		Host:            req.HostID,
 		Topic:           req.Topic,
+		SourceMaterials: strings.TrimSpace(req.SourceMaterials),
 		Script:          script,
 		WordCount:       wordCount,
 		DurationSeconds: floatPtr(duration),
 		Voices:          cloneStringMap(voices),
+		GenerationMode:  generationMode,
+		Outline:         outline,
+		Segments:        cloneOutlineSegments(segments),
 		GeneratedAt:     now,
 		AudioPath:       audioPath,
 		Status:          "audio_rendered",
@@ -297,6 +519,20 @@ func (g *Generator) renderAudio(ctx context.Context, segmentType, script string,
 		err = g.renderer.RenderSingle(ctx, script, voices["host"], audioPath, NormalizePerformanceMode(mode))
 	}
 	if err != nil {
+		return 0, err
+	}
+	duration, err := g.renderer.Duration(ctx, audioPath)
+	if err != nil {
+		return 0, err
+	}
+	return duration, nil
+}
+
+func (g *Generator) renderScriptParts(ctx context.Context, parts []ScriptPart, voices map[string]string, audioPath string, mode PerformanceMode) (float64, error) {
+	if g.renderer == nil {
+		return 0, fmt.Errorf("generator: renderer is required")
+	}
+	if err := g.renderer.RenderParts(ctx, parts, voices, audioPath, NormalizePerformanceMode(mode)); err != nil {
 		return 0, err
 	}
 	duration, err := g.renderer.Duration(ctx, audioPath)
@@ -369,6 +605,37 @@ func cloneStringMap(src map[string]string) map[string]string {
 		dst[k] = v
 	}
 	return dst
+}
+
+func cloneNewsHeadlines(src []news.Headline) []news.Headline {
+	if len(src) == 0 {
+		return nil
+	}
+	dst := make([]news.Headline, len(src))
+	copy(dst, src)
+	return dst
+}
+
+func cloneOutlineSegments(src []OutlineSegment) []OutlineSegment {
+	if len(src) == 0 {
+		return nil
+	}
+	dst := make([]OutlineSegment, len(src))
+	copy(dst, src)
+	for i := range dst {
+		dst[i].KeyPoints = append([]string(nil), src[i].KeyPoints...)
+		dst[i].Speakers = append([]string(nil), src[i].Speakers...)
+	}
+	return dst
+}
+
+func responseSnippet(text string) string {
+	text = strings.TrimSpace(strings.Join(strings.Fields(text), " "))
+	runes := []rune(text)
+	if len(runes) > 120 {
+		return string(runes[:120]) + "..."
+	}
+	return text
 }
 
 func defaultID() string {

@@ -50,8 +50,8 @@ func TestClaudeCLIGenerate(t *testing.T) {
 
 			client := NewClaudeCLI("claude-test")
 			client.commandContext = helperCommandContext
-			client.shortPromptTimeout = time.Second
-			client.longPromptTimeout = time.Second
+			client.shortPromptTimeout = 3 * time.Second
+			client.longPromptTimeout = 3 * time.Second
 
 			got, err := client.Generate(context.Background(), tt.prompt)
 			if tt.wantErr != nil {

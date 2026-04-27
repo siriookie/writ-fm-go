@@ -45,7 +45,7 @@ type OpenAIClient struct {
 
 // NewOpenAIClient returns an OpenAI-compatible client with sane defaults.
 func NewOpenAIClient(baseURL, apiKey, model string) *OpenAIClient {
-	baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	baseURL = normalizeOpenAIBaseURL(baseURL)
 	if baseURL == "" {
 		baseURL = "https://api.openai.com"
 	}
@@ -79,8 +79,7 @@ func (c *OpenAIClient) Generate(ctx context.Context, prompt string) (string, err
 	if err != nil {
 		return "", fmt.Errorf("generator/llm: marshal request: %w", err)
 	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/v1/chat/completions", bytes.NewReader(reqBody))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/chat/completions", bytes.NewReader(reqBody))
 	if err != nil {
 		return "", fmt.Errorf("generator/llm: create request: %w", err)
 	}
@@ -122,6 +121,17 @@ func (c *OpenAIClient) Generate(ctx context.Context, prompt string) (string, err
 		return "", ErrEmptyResponse
 	}
 	return content, nil
+}
+
+func normalizeOpenAIBaseURL(baseURL string) string {
+	baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	if baseURL == "" {
+		return ""
+	}
+	if strings.HasSuffix(baseURL, "/v1") {
+		return baseURL
+	}
+	return baseURL + "/v1"
 }
 
 func extractAPIError(decoded chatCompletionsResponse, raw []byte) string {
